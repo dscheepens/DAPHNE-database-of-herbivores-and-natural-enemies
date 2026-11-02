@@ -1,6 +1,6 @@
 # Paper code to "DAPHNE: A global database of pest herbivores and their natural enemies"
 
-This is the code to the preprint "DAPHNE: A global database of pest herbivores and their natural enemies"
+This repository contains the code and data for the preprint "DAPHNE: A global database of pest herbivores and their natural enemies"
 
 Daan R. Scheepens, Tim Newbold, Robin Freeman
 
