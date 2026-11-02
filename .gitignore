@@ -1,0 +1,5 @@
+# System files
+.DS_Store
+
+# other hidden files
+*.ipynb_checkpoints
