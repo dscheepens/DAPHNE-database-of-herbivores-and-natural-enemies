@@ -1,6 +1,16 @@
+################################################################################
+#                                                                              #
+#   Manual taxonomic corrections, used by 1_post_processing.r                  #
+#                                                                              #
+#   - binomial_corrections:         misspelled / abbreviated names, synonyms   #
+#   - higher_taxonomy_correction(): wrong higher taxonomy of specific names    #
+#   - fix_extracted_taxa():         row-level fixes of the extracted taxa      #
+#   - gbif_synonym_errors:          wrong synonyms returned by GBIF            #
+#                                                                              #
+################################################################################
 
 binomial_corrections <- tribble(
-  ~clean_name, ~corrected_name, ~corrected_genus, ~corrected_species, ~is_synonym, 
+  ~clean_name, ~corrected_name, ~corrected_genus, ~corrected_species, ~is_synonym,
   "A. amygdali", "Apodiphus amygdali", "Apodiphus", "amygdali", FALSE,
   "A. terebrans", "Apate terebrans", "Apate", "terebrans", FALSE,
   "D. trifasciata", "Diastocera trifasciata", "Diastocera", "trifasciata", FALSE,
@@ -1251,3 +1261,107 @@ higher_taxonomy_correction <- function(df){
   return(df)
 }
 
+
+
+
+################################################################################
+#                Row-level fixes of the extracted taxa                         #
+################################################################################
+
+# Genera of taxa that are garbled duplicates of another taxon in the same abstract
+duplicate_genera <- c("Vastrad",  # duplicate of Megastigmus dharwadicus
+                      "Rohdain",  # duplicate of Turanogonia smirnovi
+                      "Oteifa")   # "Oteifa spp.", duplicate of Pratylenchus neglectus
+
+# Taxa extracted by common name only, resolved manually from their abstracts
+common_name_taxa <- tribble(
+  ~EID,                  ~`Common Name`,                ~Phylum,      ~Class,    ~Order,         ~Family,           ~Genus,           ~Species,
+  "2-s2.0-85190673658",  "variegated locust",           "Arthropoda", "Insecta", "Orthoptera",   "Pyrgomorphidae",  "Zonocerus",      "variegatus",
+  "2-s2.0-85190673658",  "vegetable leafminer",         "Arthropoda", "Insecta", "Diptera",      "Agromyzidae",     "Liriomyza",      "sativae",
+  "2-s2.0-85190673658",  "Southern Green Stink Bug",    "Arthropoda", "Insecta", "Hemiptera",    "Pentatomidae",    "Nezara",         "viridula",
+  "2-s2.0-105002268081", "Blueberry maggot fly",        "Arthropoda", "Insecta", "Diptera",      "Tephritidae",     "Rhagoletis",     "mendax",
+  "2-s2.0-105002268081", "Blueberry spanworm",          "Arthropoda", "Insecta", "Lepidoptera",  "Geometridae",     "Itame",          "argillacearia",
+  "2-s2.0-105002268081", "Blueberry flea beetle",       "Arthropoda", "Insecta", "Coleoptera",   "Chrysomelidae",   "Altica",         "sylvia",
+  "2-s2.0-77955580541",  "green scale",                 "Arthropoda", "Insecta", "Hemiptera",    "Coccidae",        "Coccus",         "viridis",
+  "2-s2.0-77955580541",  "long-tailed mealybug",        "Arthropoda", "Insecta", "Hemiptera",    "Pseudococcidae",  "Pseudococcus",   "longispinus",
+  "2-s2.0-77955580541",  "Hawaiian endemic palm scale", "Arthropoda", "Insecta", "Hemiptera",    "Halimococcidae",  "Colobopyga",     "pritchardiae",
+  "2-s2.0-85087462111",  "Fall armyworm",               "Arthropoda", "Insecta", "Lepidoptera",  "Noctuidae",       "Spodoptera",     "frugiperda",
+  "2-s2.0-85087462111",  "Tobacco hornworm",            "Arthropoda", "Insecta", "Lepidoptera",  "Sphingidae",      "Manduca",        "sexta",
+  "2-s2.0-85108340087",  "diamondback moth",            "Arthropoda", "Insecta", "Lepidoptera",  "Plutellidae",     "Plutella",       "xylostella",
+  "2-s2.0-85108340087",  "rice leafroller",             "Arthropoda", "Insecta", "Lepidoptera",  "Crambidae",       "Cnaphalocrocis", "medinalis"
+)
+
+# Species extracted as an epithet only, because the abstract abbreviates the genus
+# (e.g. "E. orientalis"); resolved manually from their abstracts
+epithet_taxa <- tribble(
+  ~EID,                 ~Species,          ~Phylum,      ~Class,      ~Order,           ~Family,          ~Genus,          ~corrected_species,
+  "2-s2.0-84978194777", "orientalis",      "Arthropoda", "Arachnida", "Trombidiformes", "Tetranychidae",  "Eutetranychus", "orientalis",
+  "2-s2.0-84978194777", "cinnabarinus",    "Arthropoda", "Arachnida", "Trombidiformes", "Tetranychidae",  "Tetranychus",   "cinnabarinus",
+  "2-s2.0-85166678343", "rugioperculatus", "Arthropoda", "Insecta",   "Hemiptera",      "Aleyrodidae",    "Aleurodicus",   "rugioperculatus",
+  "2-s2.0-85166678343", "bondari",         "Arthropoda", "Insecta",   "Hemiptera",      "Aleyrodidae",    "Paraleyrodes",  "bondari",
+  "2-s2.0-0012713509",  "mgydrospilus",    "Arthropoda", "Insecta",   "Lepidoptera",    "Tortricidae",    "Archips",       "argyrospila", # OCR error ("A. mgyrospilus")
+  "2-s2.0-0012713509",  "nenuphar",        "Arthropoda", "Insecta",   "Coleoptera",     "Curculionidae",  "Conotrachelus", "nenuphar",
+  "2-s2.0-0012713509",  "pornonella",      "Arthropoda", "Insecta",   "Lepidoptera",    "Tortricidae",    "Cydia",         "pomonella",   # OCR error ("C. pornonella")
+  "2-s2.0-0012713509",  "ocellana",        "Arthropoda", "Insecta",   "Lepidoptera",    "Tortricidae",    "Spilonota",     "ocellana"
+)
+
+# Placeholder hyperparasitoid names: kept at the rank they name, or dropped (NA)
+hyperparasitoid_corrections <- tribble(
+  ~name,                                                                                      ~corrected,
+  "Chalcidoidea (unidentified genus)",                                                        "Chalcidoidea",
+  "Chalcidoidea (unidentified)",                                                              "Chalcidoidea",
+  "indeterminate species of Pteromalidae",                                                    "Pteromalidae",
+  "indeterminate species of Trichogrammatidae",                                               "Trichogrammatidae",
+  "Unspecified Hymenoptera hyperparasitoids (nine species recovered, mainly from braconids)", "Hymenoptera",
+  "Five hyperparasitoid species (unnamed)",                                                   NA,
+  "four hyperparasitoids (unnamed)",                                                          NA,
+  "six species of hyperparasitoids (unspecified)",                                            NA,
+  "three hyperparasitoid species (unnamed)",                                                  NA,
+  "unnamed hyperparasitoid species (8)",                                                      NA,
+  "unspecified hyperparasitoid",                                                              NA,
+  "unspecified hyperparasitoids",                                                             NA
+)
+
+fix_hyperparasitoids <- function(x) {
+  lapply(x, function(v) {
+    i <- match(str_squish(v), hyperparasitoid_corrections$name)
+    v[!is.na(i)] <- hyperparasitoid_corrections$corrected[i[!is.na(i)]]
+    unique(v[!is.na(v)])
+  })
+}
+
+# All row-level fixes; applied to the extracted data before names are built
+fix_extracted_taxa <- function(df) {
+  df %>%
+    filter(!Genus %in% duplicate_genera) %>%
+    mutate(
+      Phylum = recode(Phylum, "Arterropoda" = "Arthropoda"),
+      # one row listed "Vespula germanica, Vespula vulgaris", split into two rows
+      `Common Name` = case_when(
+        EID == "2-s2.0-84920862739" & Species == "Vespula germanica" ~ "German wasp",
+        EID == "2-s2.0-84920862739" & Species == "Vespula vulgaris"  ~ "Common wasp",
+        TRUE ~ `Common Name`),
+      hyperparasitoids = fix_hyperparasitoids(hyperparasitoids)
+    ) %>%
+    rows_update(common_name_taxa, by = c("EID", "Common Name"), unmatched = "ignore") %>%
+    left_join(epithet_taxa, by = c("EID", "Species"), suffix = c("", ".fix")) %>%
+    mutate(Phylum  = coalesce(Phylum.fix, Phylum),
+           Class   = coalesce(Class.fix, Class),
+           Order   = coalesce(Order.fix, Order),
+           Family  = coalesce(Family.fix, Family),
+           Genus   = coalesce(Genus.fix, Genus),
+           Species = coalesce(corrected_species, Species)) %>%
+    dplyr::select(-ends_with(".fix"), -corrected_species)
+}
+
+
+
+################################################################################
+#                         Errors in GBIF results                               #
+################################################################################
+
+# Synonyms returned by GBIF that belong to a different species
+gbif_synonym_errors <- tribble(
+  ~species,                ~synonym,
+  "Pterostichus strenuus", "Harpalus pygmaeus"
+)

@@ -1,3 +1,19 @@
+################################################################################
+#                                                                              #
+#   Post-processing of LLM-extracted interactions into the DAPHNE database     #
+#                                                                              #
+#   1. Load data                                                               #
+#   2. Parse list columns                                                      #
+#   3. Clean species names                                                     #
+#   4. Species reference table                                                 #
+#   5. GBIF name matching                                                      #
+#   6. Attach GBIF taxonomy and common names to the reference table            #
+#   7. Build interactions                                                      #
+#   8. Combine, filter and save                                                #
+#   9. Summary statistics                                                      #
+#  10. Figures                                                                 #
+#                                                                              #
+################################################################################
 
 library(stringr)
 library(tidyr)
@@ -11,80 +27,75 @@ library(ggplot2)
 library(patchwork)
 library(arrow)
 
-source("taxonomy_corrections.R")
+source("taxonomy_corrections.r") # all taxon-specific corrections
 
-df <- read_feather("../1_ollama-main/feather_results/dataset_complete.feather") %>% dplyr::select(-Synonyms)
-#colnames(df)
-
-# number of abstracts where nothing was extracted: 25,224
-df %>% filter(
-  (Phylum=="" & Class=="" & Order=="" & Family=="" & Genus=="" & Species=="" & `Common Name`=="")
-) %>% dplyr::summarize(length(unique(EID))) # 25,224
-
-# filter out empty rows (abstracts where nothing was extracted)
-df <- df %>% filter(
-  !(Phylum=="" & Class=="" & Order=="" & Family=="" & Genus=="" & Species=="" & `Common Name`=="")
-)
-
-# number of abstracts where species were extracted: 78,704
-length(unique(df$EID)) 
-
-# ensure that the following columns are NA if either `Host Plants` or `Herbivore Prey` are NA, respectively: 
-
-df$`Herbivore Is Pest` <- ifelse(!is.na(df$`Host Plants`), df$`Herbivore Is Pest`, "NA")
-df$`Pest Importance`   <- ifelse(!is.na(df$`Host Plants`), df$`Pest Importance`, "NA")
-df$`Herbivore Is BCA`  <- ifelse(!is.na(df$`Host Plants`), df$`Herbivore Is BCA`, "NA")
-
-df$`Important Natural Enemy` <- ifelse(!is.na(df$`Herbivore Prey`), df$`Important Natural Enemy`, "NA")
-df$`Biological Control`      <- ifelse(!is.na(df$`Herbivore Prey`), df$`Biological Control`, "NA")
-
-df$`Herbivore Is Pest` <- ifelse(df$`Host Plants`!="", ifelse(!is.na(df$`Herbivore Is Pest`), df$`Herbivore Is Pest`, "NA"), NA)
-df$`Pest Importance`   <- ifelse(df$`Host Plants`!="", ifelse(!is.na(df$`Pest Importance`), df$`Pest Importance`, "NA"), NA)
-df$`Herbivore Is BCA`  <- ifelse(df$`Host Plants`!="", ifelse(!is.na(df$`Herbivore Is BCA`), df$`Herbivore Is BCA`, "NA"), NA)
-
-df$`Important Natural Enemy` <- ifelse(df$`Herbivore Prey`!="", ifelse(!is.na(df$`Important Natural Enemy`), df$`Important Natural Enemy`, "NA"), NA)
-df$`Biological Control`      <- ifelse(df$`Herbivore Prey`!="", ifelse(!is.na(df$`Biological Control`), df$`Biological Control`, "NA"), NA)
+# GBIF lookup (section 5):
+#   "all"     - query every name (~6 hours)
+#   "missing" - only query names not yet in saved_datasets/gbif_ref_table.rds
+#   "none"    - use the saved results as they are
+gbif_mode <- "missing"
 
 
 
+################################################################################
+#                              1. Load data                                    #
+################################################################################
+
+parts <- sprintf("../2_ollama-main/raw_data/dataset_complete_part%02d.feather", 1:10)
+df <- purrr::map_dfr(parts, arrow::read_feather) %>% dplyr::select(-Synonyms)
+
+df <- df %>%
+  mutate(is_empty = Phylum == "" & Class == "" & Order == "" & Family == "" & Genus == "" & Species == "" & `Common Name` == "")
+
+# abstracts where nothing was extracted: 25,224
+df %>% filter(is_empty) %>% pull(EID) %>% n_distinct() # 25,224
+
+df <- df %>% filter(!is_empty) %>% dplyr::select(-is_empty)
+
+# abstracts where species were extracted: 78,704
+n_distinct(df$EID)
+
+# Pest / natural-enemy attributes only apply when host plants / prey were extracted
+df <- df %>%
+  mutate(
+    across(c(`Herbivore Is Pest`, `Pest Importance`, `Herbivore Is BCA`),
+           ~ ifelse(`Host Plants` != "", ifelse(!is.na(.x), .x, "NA"), NA)),
+    across(c(`Important Natural Enemy`, `Biological Control`),
+           ~ ifelse(`Herbivore Prey` != "", ifelse(!is.na(.x), .x, "NA"), NA))
+  )
 
 
+
+################################################################################
+#                          2. Parse list columns                               #
+################################################################################
 
 is_scientific_name <- function(x) {
   str_detect(x, "^[A-Z][a-z]+\\s+[a-z×.-]+")
 }
 
+# Split a comma/semicolon-separated string into a character vector, keeping
+# commas inside parentheses and quoted cultivar lists intact, and re-joining
+# lists of scientific names that share a trailing parenthetical.
 split_to_list <- function(x) {
   lapply(x, function(v) {
     if (is.na(v) || v == "") return(character(0))
-    
+
     v <- str_replace_all(v, ";", ",")
-    
-    # --- ROBUST PRE-PROCESSING FOR CULTIVARS ---
-    # We find the sequence starting with 'cultivars' and ending at the LAST quote 
-    # that is part of that cultivar list. 
-    # Logic: Look for "cultivars" and grab everything until a quote that is 
-    # followed by a comma AND a new species start (capital letter) OR the end of string.
-    
+
+    # Protect commas inside cultivar lists, e.g. "cultivars 'A', 'B', Apple (...)"
     cultivar_pattern <- "(?i)cultivars\\s+(['\"].+?['\"])(?=\\s*,\\s*[A-Z]|$)"
-    
     if (str_detect(v, cultivar_pattern)) {
-      v <- str_replace_all(v, cultivar_pattern, function(m) {
-        # Replace ONLY the commas inside this specific cultivar block
-        str_replace_all(m, ",", "|||")
-      })
+      v <- str_replace_all(v, cultivar_pattern, function(m) str_replace_all(m, ",", "|||"))
     }
-    
-    # Step 1: Split on commas not inside parentheses
+
+    # Split on commas not inside parentheses, then restore protected commas
     parts <- str_split(v, ",\\s*(?![^()]*\\))")[[1]] |> str_trim()
-    
-    # Step 2: Restore the internal commas
     parts <- str_replace_all(parts, fixed("|||"), ",")
-    
+
+    # Merge "Species A, Species B (common name)" back into a single element
     out <- character(0)
     i <- 1
-    
-    # Step 3: Standard scientific name merging behavior
     while (i <= length(parts)) {
       part <- parts[i]
       if (str_detect(part, "\\(") && is_scientific_name(part)) {
@@ -94,8 +105,7 @@ split_to_list <- function(x) {
         }
         j <- j + 1
         if (j < i) {
-          merged <- paste(parts[j:i], collapse = ", ")
-          out <- c(out, merged)
+          out <- c(out, paste(parts[j:i], collapse = ", "))
           i <- i + 1
           next
         }
@@ -107,16 +117,10 @@ split_to_list <- function(x) {
   })
 }
 
-#split_to_list("Trachycarpus fortunei, palms (Arecaceae)")
-#split_to_list("Castanea sativa × Castanea crenata (hybrid sweet chestnut), Quercus robur, Quercus petraea (oak)")
-#split_to_list("Malus spp., Prunus spp., Quercus spp., Ulmus spp., Wisteria spp., Rubus spp., Grasses (amenity turf), Solanum tuberosum, Zea mays, Glycine max, Pinus parviflora (grafted onto P. thunbergii)")
-#split_to_list("Pear (Pyrus spp.) – cultivars 'Conference', 'Dicolor', 'Bohemica', Apple (Malus domestica)")
-#split_to_list("tea gardens (Camellia sinensis) – cultivars \"Shu\", \"Ping yang te zao\", Pear (Pyrus spp.)")
-#split_to_list("mungbean, pigeonpea, soybean, wheat, rice, maize")
-#split_to_list("vegetable seedlings; crops")
-
-#comm2sci(c("mungbean", "pigeonpea", "soybean", "wheat", "rice", "maize"), db = 'ncbi', simplify = TRUE)
-#res <- gna_verifier("tea gardens (Camellia sinensis)")
+# Examples:
+# split_to_list("Trachycarpus fortunei, palms (Arecaceae)")
+# split_to_list("Castanea sativa × Castanea crenata (hybrid sweet chestnut), Quercus robur, Quercus petraea (oak)")
+# split_to_list("Pear (Pyrus spp.) – cultivars 'Conference', 'Dicolor', 'Bohemica', Apple (Malus domestica)")
 
 df <- df %>%
   mutate(
@@ -124,20 +128,19 @@ df <- df %>%
     herbivore_is_pest      = split_to_list(`Herbivore Is Pest`),
     pest_importance        = split_to_list(`Pest Importance`),
     herbivore_is_bca       = split_to_list(`Herbivore Is BCA`),
-    
+
     prey_species           = split_to_list(`Herbivore Prey`),
     important_enemy        = split_to_list(`Important Natural Enemy`),
     biological_control     = split_to_list(`Biological Control`),
-    
+
     associated_plants      = split_to_list(`Associated Plants`),
     associated_industries  = split_to_list(`Associated Industries`),
     hyperparasitoids       = split_to_list(`Hyperparasitoids`),
     invasive               = split_to_list(`Invasive`),
     vectors                = split_to_list(`Vectors`)
-    #synonyms               = split_to_list(`Synonyms`)
   )
 
-# this one needs manual correction: 
+# manual correction: hybrid name that the splitter can't handle
 df <- df %>%
   mutate(
     host_plants = if_else(
@@ -150,560 +153,339 @@ df <- df %>%
     )
   )
 
-
-# fix one case where the Species entry is given as "Vespula germanica, Vespula vulgaris"
+# one row lists two species in Species ("Vespula germanica, Vespula vulgaris")
 df <- df %>% separate_rows(Species, sep = ", ")
-df <- df %>%
-  mutate(`Common Name` = case_when(
-    EID == "2-s2.0-84920862739" & Species == "Vespula germanica" ~ "German wasp",
-    EID == "2-s2.0-84920862739" & Species == "Vespula vulgaris"  ~ "Common wasp",
-    TRUE ~ `Common Name` # Keeps all other rows the same
-  ))
 
 
+# Check: list columns that are unnested together must have equal lengths (should return 0 rows)
+df %>%
+  mutate(n_host = lengths(host_plants),
+         n_pest = lengths(herbivore_is_pest),
+         n_imp  = lengths(pest_importance),
+         n_bca  = lengths(herbivore_is_bca)) %>%
+  filter(!(n_host == n_pest & n_host == n_imp & n_host == n_bca)) %>%
+  dplyr::select(`Host Plants`, n_host, n_pest, n_imp, n_bca, `Herbivore Is Pest`, `Pest Importance`, `Herbivore Is BCA`, EID)
 
-
-
-
-# check if there are any lists that are different in length 
-check_lengths <- df %>%
-  mutate(
-    n_host = lengths(host_plants),
-    n_pest = lengths(herbivore_is_pest),
-    n_imp  = lengths(pest_importance),
-    n_bca  = lengths(herbivore_is_bca)
-  ) %>%
-  filter(!(n_host == n_pest & n_host == n_imp & n_host == n_bca))
-
-check_lengths %>%
-  dplyr::select(`Host Plants`, n_host, n_pest, n_imp, n_bca, `Herbivore Is Pest`, `Pest Importance`,`Herbivore Is BCA`, EID) 
-
-check_lengths <- df %>%
-  mutate(
-    n_prey = lengths(prey_species),
-    n_imp = lengths(important_enemy),
-    n_bio  = lengths(biological_control)
-  ) %>%
-  filter(!(n_prey == n_imp & n_imp == n_bio & n_prey == n_bio))
-
-check_lengths %>%
+df %>%
+  mutate(n_prey = lengths(prey_species),
+         n_imp  = lengths(important_enemy),
+         n_bio  = lengths(biological_control)) %>%
+  filter(!(n_prey == n_imp & n_prey == n_bio)) %>%
   dplyr::select(`Herbivore Prey`, n_prey, n_imp, n_bio, `Important Natural Enemy`, `Biological Control`, EID)
 
 
-
-
-
-
-# expand host plants such that each element represents a unique species
-# e.g. "Castanea sativa × Castanea crenata (hybrid sweet chestnut)", "Quercus robur, Quercus petraea (oak)" | TRUE, TRUE 
-# becomes "Castanea sativa × Castanea crenata (hybrid sweet chestnut)", "Quercus robur (oak)", "Quercus petraea (oak)" | TRUE, TRUE, TRUE 
+# Expand elements that share a parenthetical into one element per species, e.g.
+#   "Quercus robur, Quercus petraea (oak)" | TRUE
+#   -> "Quercus robur (oak)", "Quercus petraea (oak)" | TRUE, TRUE
+shared_paren_pattern <- "^(.+),\\s+([A-Z][a-z]+(?:\\s+[a-z.-]+)+)\\s+(\\([^)]+\\))$"
 
 expand_shared_parentheses <- function(vec) {
   if (length(vec) == 0) return(vec)
-  
-  # This regex identifies: "Species A, Species B (Common Name)"
-  # Group 1: "Species A"
-  # Group 2: "Species B"
-  # Group 3: "(Common Name)"
-  pattern <- "^(.+),\\s+([A-Z][a-z]+(?:\\s+[a-z.-]+)+)\\s+(\\([^)]+\\))$"
-  
   unlist(lapply(vec, function(item) {
-    if (str_detect(item, pattern)) {
-      parts <- str_match(item, pattern)
-      prefix_list <- parts[2] 
-      last_name   <- parts[3] 
-      suffix      <- parts[4] 
-      
-      split_prefixes <- str_split(prefix_list, ",\\s*")[[1]]
-      return(c(paste(split_prefixes, suffix), paste(last_name, suffix)))
-    } else {
-      return(item)
-    }
+    if (!str_detect(item, shared_paren_pattern)) return(item)
+    parts <- str_match(item, shared_paren_pattern) # [2] prefix list, [3] last name, [4] "(suffix)"
+    split_prefixes <- str_split(parts[2], ",\\s*")[[1]]
+    c(paste(split_prefixes, parts[4]), paste(parts[3], parts[4]))
   }))
 }
 
-# 2. Main expansion function
+# Expand the name column (first of `target_cols`) and repeat the matching
+# metadata values so all list columns stay aligned.
 expand_synced_lists <- function(df, target_cols) {
-  df %>% 
+  df %>%
     rowwise() %>%
     mutate(
-      # Create a map of how many items each element in the list will become
-      split_map = list(map_int(!!sym(target_cols[1]), ~{
-        pattern <- "^(.+),\\s+([A-Z][a-z]+(?:\\s+[a-z.-]+)+)\\s+(\\([^)]+\\))$"
-        if (!is.na(.x) && str_detect(.x, pattern)) {
-          parts <- str_match(.x, pattern)
-          return(length(str_split(parts[2], ",\\s*")[[1]]) + 1)
+      # number of elements each name expands into
+      split_map = list(map_int(!!sym(target_cols[1]), ~ {
+        if (!is.na(.x) && str_detect(.x, shared_paren_pattern)) {
+          parts <- str_match(.x, shared_paren_pattern)
+          return(length(str_split(parts[2], ",\\s*")[[1]]) + 1L)
         }
-        return(1)
+        1L
       }))
     ) %>%
-    mutate(across(all_of(target_cols), ~{
-      # val is the current list element (e.g., a vector of booleans)
-      val <- .x 
+    mutate(across(all_of(target_cols), ~ {
+      val <- .x
       if (length(val) == 0) return(list(val))
-      
       res <- if (cur_column() %in% c("host_plants", "prey_species")) {
-        # Apply the string split logic
         expand_shared_parentheses(val)
       } else {
-        # Duplicate metadata values (TRUE/FALSE) to match the new length
-        # Using the split_map calculated from the names column
         rep(val, times = split_map)
       }
-      # Return as a list so it stays contained within the single row cell
       list(res)
     })) %>%
     dplyr::select(-split_map) %>%
     ungroup()
 }
 
-# 3. Apply to dataset
 df <- expand_synced_lists(df, c("host_plants", "herbivore_is_pest", "pest_importance", "herbivore_is_bca"))
 df <- expand_synced_lists(df, c("prey_species", "important_enemy", "biological_control"))
 
 
 
-############################################
-#        harmonising species names         #   
-############################################
+################################################################################
+#                          3. Clean species names                              #
+################################################################################
 
-
-# Helper: Standardize Binomials (Genus + Species)
+# Combine Genus and Species into a single (bi)nomial
 prepare_binomial <- function(genus, species) {
-  # 1. If species is invalid, return genus (if valid) or NA
+  # invalid species -> genus (if valid) or NA
   if (is.na(species) || species == "" || toupper(species) == "NA") {
-    if (!is.na(genus) && genus != "" && toupper(genus) != "NA") {
-      return(genus)
-    }
+    if (!is.na(genus) && genus != "" && toupper(genus) != "NA") return(genus)
     return(NA_character_)
   }
+  # invalid genus -> species as is
+  if (is.na(genus) || genus == "" || toupper(genus) == "NA") return(species)
 
-  # 2. If genus is invalid but species exists, return species as is
-  if (is.na(genus) || genus == "" || toupper(genus) == "NA") {
-    return(species)
-  }
+  # drop abbreviated genus, e.g. "A. helianthi" -> "helianthi"
+  clean_species <- sub(paste0("^", substr(genus, 1, 1), "\\.\\s+"), "", species, ignore.case = TRUE)
 
-  # 3. Handle abbreviated species (e.g., "A. helianthi" -> "helianthi")
-  genus_initial <- substr(genus, 1, 1)
-  pattern <- paste0("^", genus_initial, "\\.\\s+")
-  clean_species <- sub(pattern, "", species, ignore.case = TRUE)
+  # species already a binomial (the trailing space stops "rattus" matching "^Rattus")
+  if (grepl(paste0("^", genus, "\\s+"), clean_species, ignore.case = TRUE)) return(clean_species)
 
-  # 4. Check if species is ALREADY a binomial.
-  # Using a space check prevents "rattus" from matching "^Rattus" and getting cut.
-  full_binomial_pattern <- paste0("^", genus, "\\s+")
-
-  if (grepl(full_binomial_pattern, clean_species, ignore.case = TRUE)) {
-    return(clean_species)
-  }
-
-  # 5. Combine them
-  return(paste(genus, clean_species))
+  paste(genus, clean_species)
 }
 
-# Testing the logic:
 # prepare_binomial("Acanthiophilus", "A. helianthi")             -> "Acanthiophilus helianthi"
-# prepare_binomial("Acanthiophilus", "helianthi")                -> "Acanthiophilus helianthi"
 # prepare_binomial("Acanthiophilus", "Acanthiophilus helianthi") -> "Acanthiophilus helianthi"
-# prepare_binomial("Acanthiophilus", NA)                         -> "Acanthiophilus helianthi"
-# prepare_binomial("Rattus","rattus")                            -> "Rattus rattus"
-# prepare_binomial("Rattus","Rattus")                            -> "Rattus"
+# prepare_binomial("Acanthiophilus", NA)                         -> "Acanthiophilus"
+# prepare_binomial("Rattus", "rattus")                           -> "Rattus rattus"
+
+# remove hidden format characters and redundant whitespace
+df <- df %>%
+  mutate(across(where(is.character), ~ {
+    str_replace_all(.x, "\\p{Cf}", "") %>%
+      str_replace_all("[[:space:]]+", " ") %>%
+      trimws()
+  }))
+
+# manual fixes of the extracted taxa (taxonomy_corrections.r)
+df <- fix_extracted_taxa(df)
 
 df <- df %>%
   rowwise() %>%
   mutate(clean_name = prepare_binomial(Genus, Species)) %>%
-  ungroup() %>%
-  # remove invisible whitespaces and hidden characters
-  mutate(across(where(is.character), ~ {
-    str_replace_all(.x, "\\p{Cf}", "") %>% # Removes all hidden "Format" characters
-      str_replace_all("[[:space:]]+", " ") %>%
-      trimws()
-  })) # %>% 
-  # make sure Synonyms are cleaned up 
-  # mutate(Synonyms = if_else(Synonyms %in% c("NA", "", " "), NA, Synonyms)) 
+  ungroup()
+
+# Rows without genus or species (clean_name NA, e.g. "thrips" given only as Thripidae)
+# are kept with their extracted taxonomy but are not matched to GBIF (see section 7)
 
 
-
-# general corrections
-df <- df %>% filter(Genus != "Vastrad") # duplicate of Megastigmus dharwadicus
-df <- df %>% filter(Genus != "Rohdain") # duplicate of Turanogonia smirnovi
-df <- df %>% filter(clean_name != "Oteifa spp.") # duplicate of Pratylenchus neglectus
-df <- df %>% mutate(Phylum = recode(Phylum, "Arterropoda" = "Arthropoda"))
-
-
-
-
-# ensure that `ImportantEnemy` is True if `Biocontrol` is True (but not vice versa)
-violations <- mapply(function(bc, ie) {
-  any(bc == "True" & ie == "False")
-}, df$biological_control, df$important_enemy)
-
-# Count how many rows are affected
+# Important.Enemy must be True whenever Biocontrol is True (but not vice versa)
+violations <- map2_lgl(df$biological_control, df$important_enemy, ~ any(.x == "True" & .y == "False"))
 sum(violations) # 186
 
-df$important_enemy <- mapply(function(bc, ie) {
-  # If biological_control is True, force important_enemy to True; 
-  # otherwise, keep the original value of important_enemy
-  ifelse(bc == "True", "True", ie)
-}, df$biological_control, df$important_enemy, SIMPLIFY = FALSE)
-
-df$important_enemy <- lapply(df$important_enemy, as.character)
+df$important_enemy    <- map2(df$biological_control, df$important_enemy, ~ as.character(ifelse(.x == "True", "True", .y)))
 df$biological_control <- lapply(df$biological_control, as.character)
 
-# finally, ensuring that there are no repeated entries anywhere
-df <- df %>% unique()
+# Pest must be True whenever Pest.Importance is "major"
+df$herbivore_is_pest <- map2(df$pest_importance, df$herbivore_is_pest, ~ as.character(ifelse(.x == "major", "True", .y)))
+
+df <- df %>% unique() %>% mutate(row_id = row_number())
 
 
 
-# --- Phase 1: Process main species (with synonyms) ---
+################################################################################
+#                        4. Species reference table                            #
+################################################################################
+
+# One row per (name, EID) for every named taxon: main species, prey and hyperparasitoids
 main_species_ref <- df %>%
-  rowwise() %>%
-  mutate(clean_name = prepare_binomial(Genus, Species)) %>%
-  ungroup() %>%
   filter(!is.na(clean_name)) %>%
-  # make sure Synonyms are cleaned up 
-  #mutate(Synonyms = if_else(Synonyms %in% c("NA", "", " "), NA, Synonyms)) %>%
-  dplyr::select(clean_name, Phylum, Class, Order, Family, Genus, Species, EID) %>% 
-  arrange(clean_name)
+  dplyr::select(clean_name, Phylum, Class, Order, Family, Genus, Species, EID)
 
-# --- Phase 2: Process other species (prey species and hyperparasitoids) ---
-
-all_other_species <- df %>%
-  # 1. Select the EID and the specific columns of interest
+other_species <- df %>%
   dplyr::select(EID, prey_species, hyperparasitoids) %>%
-  # 2. Pivot the columns so we have one column for the source and one for the lists
-  pivot_longer(cols = -EID, names_to = "source_column", values_to = "clean_name") %>%
-  # 3. Unnest the list-column into individual rows
+  pivot_longer(cols = -EID, names_to = "source", values_to = "clean_name") %>%
   unnest(clean_name) %>%
-  # 4. Clean up: remove NAs, empty strings, and duplicates
   filter(!is.na(clean_name), clean_name != "", clean_name != "NA") %>%
-  arrange(clean_name) %>% 
-  dplyr::select(-source_column)
+  # hyperparasitoids are insects; narrows their GBIF query (e.g. "Asaphes" is a homonym)
+  mutate(Class = if_else(source == "hyperparasitoids", "Insecta", NA_character_)) %>%
+  dplyr::select(EID, clean_name, Class)
 
-# 3. Merge 
-# Using full_join to keep taxonomic info from main_prep where clean_names match
-main_species_ref <- bind_rows(main_species_ref, all_other_species) %>%
+main_species_ref <- bind_rows(main_species_ref, other_species) %>%
   arrange(clean_name)
 
 
-
-
-
-source("taxonomy_corrections.R")
-
-correction_df <- binomial_corrections
-
+# Apply manual binomial corrections (taxonomy_corrections.r)
 resolve_names <- function(data, correction) {
   data %>%
     left_join(correction, by = "clean_name") %>%
     mutate(
-      # Always move toward the corrected name if it exists
       binomial_corrected = coalesce(corrected_name, clean_name),
-      Genus = coalesce(corrected_genus, Genus),
+      Genus   = coalesce(corrected_genus, Genus),
       Species = coalesce(corrected_species, Species),
-      # If this was a synonym, the original clean_name is the synonym
-      mentioned_as  = if_else(is_synonym, clean_name, NA_character_)
+      mentioned_as = if_else(is_synonym, clean_name, NA_character_) # original name if it was a synonym
     ) %>%
-    dplyr::select(-c("corrected_name","corrected_genus","corrected_species","is_synonym"))
+    dplyr::select(-c(corrected_name, corrected_genus, corrected_species, is_synonym))
 }
 
-# correct binomials in `main_species_ref`:
-main_species_ref <- resolve_names(main_species_ref, correction_df)
-
-# also correct higher taxonomy: 
-main_species_ref <- higher_taxonomy_correction(main_species_ref)
-
-
-
-
-
-# preprocessing
 main_species_ref <- main_species_ref %>%
-  # 1. Targeted Cleaning:
-  # This regex matches: 
-  #   ^        : Start of string
-  #   (\\S+)   : First word (captured in group 1)
-  #   \\s+     : Space
-  #   (?i)...  : Case-insensitive shorthand
-  #   $        : End of string (This prevents matching "A. sp. nr. ...")
+  resolve_names(binomial_corrections) %>%
+  higher_taxonomy_correction()
+
+
+main_species_ref <- main_species_ref %>%
+  # strip qualifiers (sp., spp., nr., cf., aff., ...) to obtain the name queried on GBIF
   mutate(binomial_shortened = str_replace_all(
-    binomial_corrected, 
-    # Match markers followed by optional space and optional digits
-    "(?i)\\s+((sp\\.|spp\\.|ssp\\.|sp\\.\\s+nov\\.|sp\\.\\s+nov\\s+near\\b|sp\\.\\s+nr\\.|sp\\.\\s+nr|sp\\.\\s+n\\.|n\\.\\s+sp\\.|sp\\.\\s+near\\b|near\\b|sp\\.\\s+indet\\.|sp\\.\\s+Indet\\.|sp\\.\\s+innom\\.|innom\\.|indet\\.|Indet\\.|nr\\.|cf\\.|aff\\.|prob\\.|nov\\.|n\\.sp\\.|n\\.1|n\\.2|n\\.\\s+1|n\\.\\s+2|sp\\.\\s+A\\b|sp\\.\\s+B\\b|sp\\.\\s+C\\b|sp\\.\\s+D\\b|sp\\.\\s+E\\b|sp\\.\\s+F\\b|sp\\.\\s+G\\b|sp\\.\\s+I\\b|sp\\.\\s+II\\b|sp\\.\\s+III\\b|sp\\.\\s+IV\\b|sp\\.\\s+V\\b|sp\\.\\s+VI\\b|sp\\.\\s+VII\\b|sp\\.\\s+VIII\\b|sp\\.\\s+IX\\b|sp\\.\\s+X\\b|sp\\.\\s+XI\\b|sp\\.\\s+XII\\b|nr\\b|s\\.l\\.)\\s*\\d*\\s*)+", 
-    " " 
-  ) %>% str_squish()) %>% # Clean up any double spaces or trailing whitespace
-  
-  # 2. remove any rows that are completely empty or NA 
+    binomial_corrected,
+    "(?i)\\s+((sp\\.|spp\\.|ssp\\.|sp\\.\\s+nov\\.|sp\\.\\s+nov\\s+near\\b|sp\\.\\s+nr\\.|sp\\.\\s+nr|sp\\.\\s+n\\.|n\\.\\s+sp\\.|sp\\.\\s+near\\b|near\\b|sp\\.\\s+indet\\.|sp\\.\\s+Indet\\.|sp\\.\\s+innom\\.|innom\\.|indet\\.|Indet\\.|nr\\.|cf\\.|aff\\.|prob\\.|nov\\.|n\\.sp\\.|n\\.1|n\\.2|n\\.\\s+1|n\\.\\s+2|sp\\.\\s+A\\b|sp\\.\\s+B\\b|sp\\.\\s+C\\b|sp\\.\\s+D\\b|sp\\.\\s+E\\b|sp\\.\\s+F\\b|sp\\.\\s+G\\b|sp\\.\\s+I\\b|sp\\.\\s+II\\b|sp\\.\\s+III\\b|sp\\.\\s+IV\\b|sp\\.\\s+V\\b|sp\\.\\s+VI\\b|sp\\.\\s+VII\\b|sp\\.\\s+VIII\\b|sp\\.\\s+IX\\b|sp\\.\\s+X\\b|sp\\.\\s+XI\\b|sp\\.\\s+XII\\b|nr\\b|s\\.l\\.)\\s*\\d*\\s*)+",
+    " "
+  ) %>% str_squish()) %>%
+  # remove rows without any name or higher taxonomy
   filter(!(
-    (is.na(binomial_corrected) | binomial_corrected == "" | binomial_corrected == "NA") &
-      (is.na(Phylum)     | Phylum == ""     | Phylum == "NA")     &
-      (is.na(Class)      | Class == ""      | Class == "NA")      &
-      (is.na(Order)      | Order == ""      | Order == "NA")      &
-      (is.na(Family)     | Family == ""     | Family == "NA")
+    (is.na(binomial_corrected) | binomial_corrected %in% c("", "NA")) &
+      (is.na(Phylum) | Phylum %in% c("", "NA")) &
+      (is.na(Class)  | Class  %in% c("", "NA")) &
+      (is.na(Order)  | Order  %in% c("", "NA")) &
+      (is.na(Family) | Family %in% c("", "NA"))
   ))
 
 
-
-
-
-# harmonising higher taxonomy by replacing taxonomy with most common terms 
+# Most frequent valid value of x (NA if none)
 get_most_common <- function(x) {
-  # Remove NA and empty strings
-  valid_x <- x[!is.na(x) & x != "" & x != "character(0)" & x != "NA"]
-  
+  valid_x <- x[!is.na(x) & !x %in% c("", "character(0)", "NA")]
   if (length(valid_x) == 0) return(NA_character_)
-  
-  # Count frequencies and return the name of the most common one
   counts <- table(valid_x)
   names(counts)[which.max(counts)]
 }
 
-
-# main_species_ref <- readRDS("saved_datasets/main_species_ref.rds")
-
-
-# Apply to main_species_ref dataframe
 main_species_ref <- main_species_ref %>%
-  
-  # correct errors due to shifted taxonomy: 
-  mutate(Phylum = if_else(Class %in% c("Insecta","Arachnida","Arthropoda","Hexapoda"), "Arthropoda", Phylum)) %>% 
-  mutate(Phylum = if_else(Class %in% c("Amphibia", "Mammalia", "Aves"), "Chordata", Phylum)) %>% 
-  mutate(is_insect = Order == "Insecta",
-         Class = if_else(is_insect, "Insecta", Class), # if Order==Insecta, change class to Insecta 
-         Order = if_else(is_insect, Family, Order), # if Order==Insecta, shift family info to order 
-         Family = if_else(is_insect, NA_character_, Family), # ... and change family to NA 
-         is_arthropod = Class == "Arthropoda",
-         Class = if_else(is_arthropod, Order, Class), # if Class==Arthropoda, shift order info to class 
-         Order = if_else(is_arthropod, Family, Order), # ... and shift family info to order 
-         Family = if_else(is_arthropod, NA_character_, Family) # ... and change family to NA 
-  ) %>% dplyr::select(-is_insect, -is_arthropod) %>% 
-  
+  # fix taxonomy shifted by one rank (`%in%` keeps rows with missing ranks unchanged)
+  mutate(Phylum = if_else(Class %in% c("Insecta", "Arachnida", "Arthropoda", "Hexapoda"), "Arthropoda", Phylum),
+         Phylum = if_else(Class %in% c("Amphibia", "Mammalia", "Aves"), "Chordata", Phylum)) %>%
+  mutate(is_insect = Order %in% "Insecta",       # Order == Insecta: shift Family -> Order
+         Class  = if_else(is_insect, "Insecta", Class),
+         Order  = if_else(is_insect, Family, Order),
+         Family = if_else(is_insect, NA_character_, Family),
+         is_arthropod = Class %in% "Arthropoda", # Class == Arthropoda: shift Order -> Class, Family -> Order
+         Class  = if_else(is_arthropod, Order, Class),
+         Order  = if_else(is_arthropod, Family, Order),
+         Family = if_else(is_arthropod, NA_character_, Family)) %>%
+  dplyr::select(-is_insect, -is_arthropod) %>%
+  # harmonise taxonomy across mentions of the same name
   group_by(binomial_shortened) %>%
-  mutate(
-    Phylum = #if_else(is.na(Phylum) | Phylum == "" | Phylum == "NA", 
-                     get_most_common(Phylum),
-    Class  = #if_else(is.na(Class) | Class == "" | Class == "NA", 
-                     get_most_common(Class), 
-    Order  = #if_else(is.na(Order) | Order == "" | Order == "NA", 
-                     get_most_common(Order), 
-    Family = #if_else(is.na(Family) | Family == "" | Family == "NA", 
-                     get_most_common(Family), 
-    Genus = #if_else(is.na(Genus) | Genus == "" | Genus == "NA", 
-                     get_most_common(Genus), 
-    Species = #if_else(is.na(Species) | Species == "" | Species == "NA", 
-                     get_most_common(Species)
-  ) %>%
-  ungroup() %>% 
-  unique() 
-  
+  mutate(across(c(Phylum, Class, Order, Family, Genus, Species), get_most_common)) %>%
+  ungroup() %>%
+  unique()
+
 saveRDS(main_species_ref, "saved_datasets/main_species_ref.rds")
 
 
 
-# merge these rows into single species entries before calling GBIF
-# this combines different species names that point towards the same GBIF name into synonyms
+################################################################################
+#                          5. GBIF name matching                               #
+################################################################################
 
+# One row per name to query; names that only differ by synonym are merged
 main_species_ref_merged <- main_species_ref %>%
   group_by(binomial_shortened, Phylum, Class, Order, Family, Genus) %>%
   dplyr::summarise(
     EIDs = list(unique(unlist(EID))),
     Synonyms = list({
-      # 1. Combine existing synonyms 
-      raw_syns <- c(mentioned_as[mentioned_as != binomial_corrected]) # don't use the Synonyms column as it's error-prone -> raw_syns <- c(unlist(Synonyms), mentioned_as[mentioned_as != binomial_corrected])
-      
-      # 2. Split any strings that contain commas, then flatten (unlist)
-      split_syns <- unlist(str_split(raw_syns, ",\\s*"))
-      
-      # 3. Clean: remove duplicates, NAs, and empty/placeholder strings
-      clean_syns <- unique(split_syns)
-      clean_syns[!is.na(clean_syns) & trimws(clean_syns) != "" & trimws(clean_syns) != "NA"]
+      syns <- unlist(str_split(mentioned_as[mentioned_as != binomial_corrected], ",\\s*"))
+      syns <- unique(syns)
+      syns[!is.na(syns) & !trimws(syns) %in% c("", "NA")]
     }),
     .groups = "drop"
   )
 
-# rm(binomial_corrections, all_other_species, check_lengths, correction_df, violations, higher_taxonomy_correction)
-
 
 safe_extract <- function(val) {
   if (is.null(val) || length(val) == 0) return(NA_character_)
-  return(as.character(val))
+  as.character(val)
 }
 
-
-# Helper function to retry API calls on failure
-safe_api_call <- function(url, max_retries = 3) {
-  attempt <- 1
-  while (attempt <= max_retries) {
+# GET a GBIF API url, retrying on failure; returns parsed JSON or NULL
+safe_api_call <- function(url, max_retries = 5) {
+  for (attempt in seq_len(max_retries)) {
     res <- tryCatch({
       response <- GET(url)
-      
-      # Check for HTTP errors before parsing
-      if (status_code(response) != 200) {
-        stop(paste("HTTP Error:", status_code(response)))
-      }
-      
-      # Verify it's actually JSON content
-      if (!grepl("application/json", headers(response)[["content-type"]])) {
-        stop("Received HTML/non-JSON response from server")
-      }
-      
+      if (status_code(response) != 200) stop(paste("HTTP Error:", status_code(response)))
+      if (!grepl("application/json", headers(response)[["content-type"]])) stop("Received HTML/non-JSON response from server")
       fromJSON(content(response, "text", encoding = "UTF-8"))
     }, error = function(e) {
       message(paste("Attempt", attempt, "failed for", url, "-", e$message))
       NULL
     })
-    
     if (!is.null(res)) return(res)
-    
-    # Wait before retrying
     Sys.sleep(1.5 * attempt)
-    attempt <- attempt + 1
   }
-  return(NULL)
+  NULL
 }
 
-
-# obtaining GBIF names and taxonomy for each species name in `main_species_ref_merged` to harmonise names
-
-st1 <- Sys.time()
-ref_table <- map_df(1:nrow(main_species_ref_merged), function(i) {
-  
-  row <- main_species_ref_merged[i, ]
-  
-  cat(i,"\t|",row$binomial_shortened,"\n")
-  
-  # ----------------------------
-  # Helper function to query GBIF
-  # ----------------------------
-  try_match <- function(name_to_query, rank_to_query) {
-    
-    query_list <- list(
-      name   = name_to_query,
-      rank   = rank_to_query,
-      strict = "false",
-      verbose = "true",
-      phylum = row$Phylum,
-      class  = row$Class,
-      order  = row$Order,
-      family = row$Family,
-      genus = row$Genus
-    )
-    
-    query_list <- query_list[sapply(query_list, function(x) {
-      !is.na(x) && x != "" && x != "NA" && !is.null(x)
-    })]
-    
-    query_string <- paste0(names(query_list), "=",
-                           sapply(query_list, URLencode),
-                           collapse = "&")
-    
-    match_url <- paste0("https://api.gbif.org/v1/species/match?", query_string)
-    
-    safe_api_call(match_url)
-  }
-  
-  # ----------------------------
-  # Define fallback hierarchy
-  # ----------------------------
-  hierarchy <- list(
-    SPECIES = row$binomial_shortened,
-    GENUS   = row$Genus,
-    FAMILY  = row$Family,
-    ORDER   = row$Order,
-    CLASS   = row$Class,
-    PHYLUM  = row$Phylum
+# Match one name on GBIF, constrained by the extracted higher taxonomy
+gbif_match <- function(name, rank, row) {
+  query_list <- list(
+    name    = name,
+    rank    = rank,
+    strict  = "false",
+    verbose = "true",
+    phylum  = row$Phylum,
+    class   = row$Class,
+    order   = row$Order,
+    family  = row$Family,
+    genus   = row$Genus
   )
-  
-  # Clean hierarchy (remove missing levels)
-  hierarchy <- hierarchy[sapply(hierarchy, function(x) {
-    !is.na(x) && x != "" && x != "NA"
-  })]
-  
-  data <- NULL
-  
-  # ----------------------------
-  # 1. Try main name first
-  # ----------------------------
-  if (!is.na(row$binomial_shortened) && row$binomial_shortened != "") {
-    
-    word_count <- str_count(row$binomial_shortened, "\\S+")
-    
-    if (word_count >= 2) {
-      rank_name <- "SPECIES" # assume species
-    } else {
-      rank_name <- "GENUS"
-    }
-    data <- try_match(row$binomial_shortened, rank_name)
-  }
-  
-  # ----------------------------
-  # 2. Try synonyms if species fails
-  # ----------------------------
-  if ((is.null(data) || is.null(data$usageKey) || data$rank!=rank_name) &&
-      length(row$Synonyms[[1]]) > 0) {
-    
-    for (syn in row$Synonyms[[1]]) {
-      data_syn <- try_match(syn, rank_name)
-      if (!is.null(data_syn$usageKey) && data_syn$rank==rank_name){
-        data <- data_syn
-        break
-      }
-    }
-  }
-  
-  # if still failed to retreive at the right rank level, check alterantives: 
-  if ((is.null(data) || is.null(data$usageKey) || data$rank!=rank_name) && 
-      (!is.null(data$alternatives) && length(data$alternatives)>0)){
-    # pick first alternative (with highest similarity)
-    data_alt <- data$alternatives[1,]
-    if (data_alt$matchType=="EXACT"){ 
-      if (!is.na(row$Phylum)){
-        if (data_alt$phylum==row$Phylum){ # only extract data if it's from the same phylum
-          data <- data_alt
+  query_list <- query_list[sapply(query_list, function(x) !is.null(x) && !is.na(x) && !x %in% c("", "NA"))]
+  query_string <- paste0(names(query_list), "=", sapply(query_list, URLencode), collapse = "&")
+  safe_api_call(paste0("https://api.gbif.org/v1/species/match?", query_string))
+}
+
+# GBIF match of each name in `names_df`; names without a match get a row with
+# matchType "NONE", failed requests get no row (and are retried on the next run)
+query_gbif <- function(names_df) {
+  map_df(seq_len(nrow(names_df)), function(i) {
+
+    row <- names_df[i, ]
+    cat(i, "\t|", row$binomial_shortened, "\n")
+
+    if (is.na(row$binomial_shortened) || row$binomial_shortened == "") return(NULL)
+
+    rank_name <- if (str_count(row$binomial_shortened, "\\S+") >= 2) "SPECIES" else "GENUS"
+    is_miss <- function(d) is.null(d) || is.null(d$usageKey) || !identical(d$rank, rank_name)
+
+    # 1. main name
+    data <- gbif_match(row$binomial_shortened, rank_name, row)
+
+    # 2. synonyms
+    if (is_miss(data)) {
+      for (syn in row$Synonyms[[1]]) {
+        data_syn <- gbif_match(syn, rank_name, row)
+        if (!is_miss(data_syn)) {
+          data <- data_syn
+          break
         }
       }
     }
-  }
-  
-  # ----------------------------
-  # Process success
-  # ----------------------------
-  if (!is.null(data) && !is.null(data$usageKey)) {
-    
-    status <- data$status
+
+    # 3. best alternative, if it is an exact match within the same phylum
+    if (is_miss(data) && !is.null(data$alternatives) && length(data$alternatives) > 0) {
+      data_alt <- data$alternatives[1, ]
+      if (isTRUE(data_alt$matchType == "EXACT") && isTRUE(data_alt$phylum == row$Phylum)) {
+        data <- data_alt
+      }
+    }
+
+    if (is.null(data)) return(NULL)                                   # request failed: retried next run
+    if (is.null(data$usageKey)) data <- list(matchType = "NONE")      # no match: recorded as such
+
+    status    <- data$status
     matchType <- data$matchType
-    
-    # obtain synonyms 
-    
-    taxon_key <- data$usageKey
-    
-    
-    if (matchType!="HIGHERRANK"){
-      # if taxon is itself a synonym, take info from species it is a synonym of 
-      if (!is.null(data$acceptedUsageKey) && !is.na(data$acceptedUsageKey)){
-        if (data$usageKey!=data$acceptedUsageKey){
-          taxon_key <- data$acceptedUsageKey
-          taxon_url <- paste0(
-            "https://api.gbif.org/v1/species/",
-            taxon_key)
-          data <- safe_api_call(taxon_url)
-        }
+    taxon_key <- data$usageKey %||% NA_integer_
+
+    synonyms_vec <- character(0)
+    if (!matchType %in% c("HIGHERRANK", "NONE")) {
+      # if the match is a synonym, take the info of the accepted taxon
+      if (!is.null(data$acceptedUsageKey) && !is.na(data$acceptedUsageKey) && data$usageKey != data$acceptedUsageKey) {
+        taxon_key <- data$acceptedUsageKey
+        data <- safe_api_call(paste0("https://api.gbif.org/v1/species/", taxon_key))
       }
+      # GBIF synonyms (skipped for HIGHERRANK, which would return the synonyms of the genus/family)
+      synonyms_data <- safe_api_call(paste0("https://api.gbif.org/v1/species/", taxon_key, "/synonyms"))
+      if (!is.null(synonyms_data$results)) synonyms_vec <- synonyms_data$results$canonicalName
     }
-    
-    synonyms_url <- paste0(
-      "https://api.gbif.org/v1/species/",
-      taxon_key,
-      "/synonyms"
-    )
-    
-    synonyms_data <- safe_api_call(synonyms_url)
-    
-    synonyms_vec <- if (!is.null(synonyms_data$results)) {
-      synonyms_data$results$canonicalName
-    } else {
-      character(0)
-    }
-    
+
     data.frame(
       gbif_id        = taxon_key,
       gbif_phylum    = safe_extract(data$phylum),
@@ -722,555 +504,418 @@ ref_table <- map_df(1:nrow(main_species_ref_merged), function(i) {
       status         = safe_extract(status),
       matchType      = safe_extract(matchType)
     )
+  })
+}
+
+st1 <- Sys.time()
+if (gbif_mode == "all") {
+  ref_table <- query_gbif(main_species_ref_merged)
+} else {
+  ref_table <- readRDS("saved_datasets/gbif_ref_table.rds")
+  if (gbif_mode == "missing") {
+    new_names <- main_species_ref_merged %>% filter(!binomial_shortened %in% ref_table$original_names)
+    message(nrow(new_names), " names to query on GBIF")
+    ref_table <- bind_rows(ref_table, query_gbif(new_names))
   }
-  
-})
+}
+print(Sys.time() - st1) # "all": ~6 hours
 
-# %>% distinct(gbif_id, .keep_all = TRUE)
-
-st2 <- Sys.time()
-print(st2 - st1) # Time difference of 6.624816 hours
-
-saveRDS(ref_table, "saved_datasets/gbif_ref_table.rds")
+if (gbif_mode != "none") saveRDS(ref_table, "saved_datasets/gbif_ref_table.rds")
 
 
-# ref_table <- readRDS("saved_datasets/gbif_ref_table.rds")
+
+################################################################################
+#       6. Attach GBIF taxonomy and common names to the reference table        #
+################################################################################
+
+is_higher_rank <- ref_table$matchType %in% "HIGHERRANK"
+
 ref_table <- ref_table %>%
-  mutate(scientificName = if_else(matchType!="HIGHERRANK", scientificName, NA),
-         canonicalName  = if_else(matchType!="HIGHERRANK", canonicalName, NA),
-         gbif_id        = if_else(matchType!="HIGHERRANK", gbif_id, NA)) %>% 
-  # separate higher rank names from rest
+  # HIGHERRANK matches (e.g. species only matched to its genus) keep the higher
+  # taxonomy but not the name, ID or synonyms of the matched higher taxon
+  mutate(scientificName = if_else(is_higher_rank, NA, scientificName),
+         canonicalName  = if_else(is_higher_rank, NA, canonicalName),
+         gbif_id        = if_else(is_higher_rank, NA, gbif_id),
+         gbif_synonyms  = I(map2(gbif_synonyms, is_higher_rank, ~ if (.y) character(0) else .x))) %>%
   group_by(original_names) %>%
   mutate(synonyms = list({
            combined <- unique(c(unlist(synonyms), unlist(gbif_synonyms)))
            combined[!is.na(combined) & combined != ""]
-           }),
-         gbif_id        = get_most_common(gbif_id),
-         gbif_phylum    = get_most_common(gbif_phylum),
-         gbif_class     = get_most_common(gbif_class),
-         gbif_order     = get_most_common(gbif_order),
-         gbif_family    = get_most_common(gbif_family),
-         gbif_genus     = get_most_common(gbif_genus),
-         gbif_species   = get_most_common(gbif_species),
-         scientificName = get_most_common(scientificName),
-         canonicalName  = get_most_common(canonicalName)
-         ) %>%
-  ungroup() %>% 
-  mutate(synonyms = I(synonyms)) %>% 
-  # manually correct a GBIF error: 
-  mutate(
-    synonyms = purrr::map2(
-      synonyms,
-      gbif_species,
-      ~ if (isTRUE(.y == "Pterostichus strenuus")) {
-        .x[.x != "Harpalus pygmaeus"]
-      } else {
-        .x
-      }
-    )
-  ) %>% 
-  dplyr::select(gbif_id, gbif_phylum, gbif_class, gbif_order, gbif_family, gbif_genus, gbif_species, scientificName, canonicalName, binomial_shortened = original_names, synonyms, EID = EIDs) %>%
-  unnest(EID) %>% 
-  distinct() 
+         }),
+         across(c(gbif_id, gbif_phylum, gbif_class, gbif_order, gbif_family, gbif_genus, gbif_species, scientificName, canonicalName),
+                get_most_common)) %>%
+  ungroup() %>%
+  # remove wrong GBIF synonyms (taxonomy_corrections.r)
+  mutate(synonyms = map2(synonyms, gbif_species, ~ .x[!.x %in% gbif_synonym_errors$synonym[gbif_synonym_errors$species %in% .y]])) %>%
+  dplyr::select(gbif_id, gbif_phylum, gbif_class, gbif_order, gbif_family, gbif_genus, gbif_species, scientificName, canonicalName,
+                binomial_shortened = original_names, synonyms) %>%
+  # one row per name: GBIF results don't depend on the abstract, so names from
+  # abstracts that weren't in the GBIF run are matched as well
+  distinct(binomial_shortened, .keep_all = TRUE)
 
 
-#main_species_ref <- readRDS("saved_datasets/main_species_ref.rds")
-main_species_ref <- main_species_ref %>% 
-  left_join(ref_table, by=c("EID", "binomial_shortened")) %>% 
-  mutate(ref_phylum = coalesce(gbif_phylum, if_else(is.na(gbif_phylum), NA, Phylum)),
-         ref_class  = coalesce(gbif_class, if_else(is.na(gbif_class), NA, Class)),
-         ref_order  = coalesce(gbif_order, if_else(is.na(gbif_order), NA, Order)),
-         ref_family = coalesce(gbif_family, if_else(is.na(gbif_family), NA, Family)),
-         ref_genus  = coalesce(gbif_genus, if_else(is.na(gbif_genus), NA, Genus)),
-         ref_species  = coalesce(gbif_species, if_else(is.na(gbif_species), NA, Species))
-         ) %>% 
-  dplyr::select(-c(Phylum, Class, Order, Family, Genus, Species, gbif_phylum, gbif_class, gbif_order, gbif_family, gbif_genus, gbif_species)) %>% 
+# ref_* columns: GBIF taxonomy, falling back to the extracted (harmonised) taxonomy
+main_species_ref <- main_species_ref %>%
+  left_join(ref_table, by = "binomial_shortened") %>%
+  mutate(ref_phylum  = coalesce(gbif_phylum, Phylum),
+         ref_class   = coalesce(gbif_class, Class),
+         ref_order   = coalesce(gbif_order, Order),
+         ref_family  = coalesce(gbif_family, Family),
+         ref_genus   = coalesce(gbif_genus, Genus),
+         ref_species = coalesce(gbif_species, Species)) %>%
+  dplyr::select(-c(Phylum, Class, Order, Family, Genus, Species, gbif_phylum, gbif_class, gbif_order, gbif_family, gbif_genus, gbif_species)) %>%
   distinct()
 
 
-# summarise common names in main_species_ref
-# df <- readRDS("saved_datasets/dataset_postprocessed.rds")
-main_species_ref <- main_species_ref %>% 
-  left_join(
-    df %>%
-      left_join(main_species_ref %>% dplyr::select(clean_name,EID,canonicalName), by = c("clean_name", "EID")) %>%
-      mutate(clean_name = coalesce(canonicalName, clean_name)) %>% 
-      group_by(clean_name) %>%
-      summarise(
-        common_names = I(list(
-          `Common Name` %>%
-            tolower() %>%
-            str_squish() %>%
-            .[!{ . %in% c("", "na") | is.na(.) }] %>%
-            unique()
-        )),
-        .groups = "drop"
-      ),
-    by = c("clean_name")
-  )
-  
+# Lower-case, unique, non-empty common names
+clean_common_names <- function(x) {
+  x <- str_squish(tolower(x))
+  unique(x[!is.na(x) & !x %in% c("", "na")])
+}
+
+# Common names, pooled per canonical name (or clean_name if unmatched)
+common_names_df <- df %>%
+  filter(!is.na(clean_name)) %>%
+  left_join(main_species_ref %>% dplyr::select(clean_name, EID, canonicalName), by = c("clean_name", "EID")) %>%
+  mutate(common_key = coalesce(canonicalName, clean_name)) %>%
+  group_by(common_key) %>%
+  summarise(common_names = I(list(clean_common_names(`Common Name`))), .groups = "drop")
+
+main_species_ref <- main_species_ref %>%
+  mutate(common_key = coalesce(canonicalName, clean_name)) %>%
+  left_join(common_names_df, by = "common_key") %>%
+  dplyr::select(-common_key)
 
 saveRDS(main_species_ref, "saved_datasets/main_species_ref.rds")
 
 
 
+################################################################################
+#                          7. Build interactions                               #
+################################################################################
 
+# Full binomial from genus + name; NA unless the name resolves to species level
 combine_binomial <- function(genus, species) {
-  # 1. Standardise NAs and empty strings
   genus <- if_else(genus == "" | toupper(genus) == "NA", NA_character_, genus)
-  # Treat empty/NA species as an empty string for the logic below
   species_clean <- if_else(is.na(species) | species == "" | toupper(species) == "NA", "", species)
-  
-  # 2. Logic
+
   case_when(
-    # If genus is NA, return NA
     is.na(genus) ~ NA_character_,
-    
-    # If genus and species are identical, return NA
     toupper(genus) == toupper(species_clean) ~ NA_character_,
-    
-    # If species is empty, return NA (since we want a binomial, not just a genus)
     species_clean == "" ~ NA_character_,
-    
     TRUE ~ {
-      # Remove Genus from the start of species if it's already there
-      # e.g., "Aphis" + "Aphis fabae" -> "fabae"
+      # drop the genus if it is already part of the name, e.g. "Aphis fabae" -> "fabae"
       epithet <- str_remove(species_clean, regex(paste0("^", genus, "\\s*"), ignore_case = TRUE))
-      
-      # Final check: if after removing the genus nothing is left, return NA
       if_else(epithet == "", NA_character_, paste(genus, epithet))
     }
   )
 }
 
+na_blank <- function(x) if_else(x %in% c("", "NA"), NA_character_, x)
+
+# Columns describing a taxon; prefixed with "Subject." or "Object." in the output
+taxon_cols <- c("Phylum", "Class", "Order", "Family", "Genus", "Species", "ScientificName", "CanonicalName", "Verbatim", "Synonyms", "Common", "ID")
+
+# Named taxa (one row per name and EID), described by the GBIF-matched reference table
+named_taxa <- main_species_ref %>%
+  transmute(EID,
+            Verbatim       = clean_name,
+            Name           = coalesce(canonicalName, binomial_shortened),
+            Phylum         = ref_phylum,
+            Class          = ref_class,
+            Order          = ref_order,
+            Family         = ref_family,
+            Genus          = ref_genus,
+            Species        = combine_binomial(Genus, Name),
+            ScientificName = scientificName,
+            CanonicalName  = canonicalName,
+            Synonyms       = unclass(synonyms),
+            Common         = unclass(common_names),
+            ID             = gbif_id)
+
+# Main species of each row of df: the named taxon or, for rows without genus/species,
+# the extracted taxonomy and common name, named after the lowest rank given
+main_taxa <- bind_rows(
+  df %>%
+    filter(!is.na(clean_name)) %>%
+    dplyr::select(row_id, EID, clean_name) %>%
+    left_join(named_taxa, by = c("clean_name" = "Verbatim", "EID")) %>%
+    rename(Verbatim = clean_name),
+  df %>%
+    filter(is.na(clean_name)) %>%
+    mutate(across(c(Phylum, Class, Order, Family), na_blank)) %>%
+    transmute(row_id, EID,
+              Name     = coalesce(Family, Order, Class, Phylum),
+              Verbatim = Name,
+              Phylum, Class, Order, Family,
+              Synonyms = list(NULL),
+              Common   = map(`Common Name`, clean_common_names))
+) %>%
+  dplyr::select(-EID)
+
+# Prefix taxon columns with `role`; the taxon name becomes the `role` column itself
+as_role <- function(taxa, role) {
+  taxa %>%
+    rename(!!role := Name) %>%
+    rename_with(~ paste0(role, ".", .x), any_of(taxon_cols))
+}
+
+subject_cols <- paste0("Subject.", taxon_cols)
+object_cols  <- paste0("Object.", taxon_cols)
 
 
-################################################################################
-#                               Herbivores                                     # 
-################################################################################
+# --- Herbivores: Subject = herbivore, Object = host plant (not GBIF-matched) ---
 
-herbivory_interactions <- df %>% 
-  dplyr::select(clean_name, Phylum, Class, Order, Family, Genus, Species,
-                Type, `Feeding Mode`, host_plants, herbivore_is_pest, pest_importance, herbivore_is_bca, associated_plants, associated_industries, invasive, vectors, EID, Abstract, Generated.Response = `Generated Response`) %>%
+herbivory_interactions <- df %>%
+  dplyr::select(row_id, Type, `Feeding Mode`, host_plants, herbivore_is_pest, pest_importance, herbivore_is_bca,
+                associated_industries, invasive, vectors, EID, Abstract, Generated.Response = `Generated Response`) %>%
   unnest(c(host_plants, herbivore_is_pest, pest_importance, herbivore_is_bca)) %>%
-  
-  # Use the cleaned main_species_ref for the join
-  left_join(main_species_ref, by = c("clean_name", "EID")) %>%
-  
-  mutate(Subject = coalesce(canonicalName, binomial_shortened),
-         Subject.Phylum = coalesce(ref_phylum, if_else(is.na(ref_phylum), NA, Phylum)), 
-         Subject.Class  = coalesce(ref_class, if_else(is.na(ref_class), NA, Class)), 
-         Subject.Order  = coalesce(ref_order, if_else(is.na(ref_order), NA, Order)), 
-         Subject.Family = coalesce(ref_family, if_else(is.na(ref_family), NA, Family)), 
-         Subject.Genus  = coalesce(ref_genus, if_else(is.na(ref_genus), NA, Genus)), 
-         Subject.Species = combine_binomial(Subject.Genus, Subject), # stitch together species name if Subject is composed of genus and/or species
-         Subject.ScientificName = scientificName,
-         Subject.CanonicalName = canonicalName,
-         Subject.Verbatim = clean_name,
-         Subject.Synonyms = synonyms, 
-         Subject.Common = common_names,
-         Subject.ID = gbif_id) %>%
-  
-  mutate(Object = host_plants) %>% 
-  # Final formatting
-  transmute(
-    Subject = Subject,
-    Object = Object,
-    Type, 
-    Feeding.Mode = `Feeding Mode`,
-    Pest = as.logical(herbivore_is_pest),
-    Pest.Importance = pest_importance,
-    Herbivore.IsBCA = as.logical(herbivore_is_bca),
-    Associated.Industries = I(associated_industries), 
-    InvasiveIn = I(invasive), 
-    Vectors = I(vectors),
-    EID, 
-    Abstract,
-    Generated.Response,
-    Subject.Phylum, Subject.Class, Subject.Order, Subject.Family, Subject.Genus, Subject.Species, Subject.ScientificName, Subject.CanonicalName, Subject.Verbatim, Subject.Synonyms, Subject.Common, Subject.ID
-  )
+  left_join(as_role(main_taxa, "Subject"), by = "row_id") %>%
+  mutate(Object                = host_plants,
+         Object.Verbatim       = host_plants,
+         Feeding.Mode          = `Feeding Mode`,
+         Pest                  = as.logical(herbivore_is_pest),
+         Pest.Importance       = pest_importance,
+         Herbivore.IsBCA       = as.logical(herbivore_is_bca),
+         Associated.Industries = I(associated_industries),
+         InvasiveIn            = I(invasive),
+         Vectors               = I(vectors)) %>%
+  dplyr::select(Subject, Object, Type, Feeding.Mode, Pest, Pest.Importance, Herbivore.IsBCA,
+                Associated.Industries, InvasiveIn, Vectors, EID, Abstract, Generated.Response,
+                all_of(subject_cols), Object.Verbatim)
 
 
-
-################################################################################
-#                             Natural enemies                                  # 
-################################################################################
-
+# --- Natural enemies: Subject = natural enemy, Object = prey ---
 
 predation_interactions <- df %>%
-  dplyr::select(clean_name, Phylum, Class, Order, Family, Genus, Species,
-                Type, `Feeding Mode`, prey_species, important_enemy, biological_control, associated_plants, associated_industries, vectors, EID, Abstract, Generated.Response = `Generated Response`) %>%
+  dplyr::select(row_id, Type, `Feeding Mode`, prey_species, important_enemy, biological_control,
+                associated_plants, associated_industries, vectors, EID, Abstract, Generated.Response = `Generated Response`) %>%
   unnest(c(prey_species, important_enemy, biological_control)) %>%
-  
-  # 1. Join for Subject
-  left_join(main_species_ref, by = c("clean_name", "EID")) %>%
-  mutate(Subject = coalesce(canonicalName, binomial_shortened),
-         Subject.Phylum = coalesce(ref_phylum, if_else(is.na(ref_phylum), NA, Phylum)), 
-         Subject.Class  = coalesce(ref_class, if_else(is.na(ref_class), NA, Class)), 
-         Subject.Order  = coalesce(ref_order, if_else(is.na(ref_order), NA, Order)), 
-         Subject.Family = coalesce(ref_family, if_else(is.na(ref_family), NA, Family)), 
-         Subject.Genus  = coalesce(ref_genus, if_else(is.na(ref_genus), NA, Genus)), 
-         Subject.Species = combine_binomial(Subject.Genus, Subject), # stitch together species name if Subject is composed of genus and/or species
-         Subject.ScientificName = scientificName,
-         Subject.CanonicalName = canonicalName,
-         Subject.Verbatim = clean_name,
-         Subject.Synonyms = synonyms,
-         Subject.Common = common_names,
-         Subject.ID = gbif_id) %>%
-  
-  # Drop joined columns so the next join is 'clean'
-  dplyr::select(-starts_with("ref_"), -c(canonicalName, scientificName, binomial_corrected, binomial_shortened, mentioned_as, gbif_id, synonyms, common_names)) %>% 
-  
-  # 2. Join for Object (Prey)
-  left_join(main_species_ref, by = c("prey_species" = "clean_name", "EID")) %>%
-  mutate(Object = coalesce(canonicalName, binomial_shortened),
-         Object.Phylum = ref_phylum, 
-         Object.Class  = ref_class, 
-         Object.Order  = ref_order, 
-         Object.Family = ref_family, 
-         Object.Genus  = ref_genus, 
-         Object.Species = combine_binomial(Object.Genus, Object), # stitch together species name if Subject is composed of genus and/or species
-         Object.ScientificName = scientificName,
-         Object.CanonicalName = canonicalName,
-         Object.Verbatim = clean_name,
-         Object.Synonyms = synonyms,
-         Object.Common = common_names,
-         Object.ID = gbif_id) %>%
-  
-  # 3. Final formatting
-  transmute(
-    Subject, 
-    Object,
-    Type,
-    Feeding.Mode = `Feeding Mode`,
-    Important.Enemy = as.logical(important_enemy),
-    Biocontrol = as.logical(biological_control),
-    Associated.Plants = I(associated_plants),
-    Associated.Industries = I(associated_industries),
-    Vectors = I(vectors),
-    EID, 
-    Abstract,
-    Generated.Response,
-    Subject.Phylum, Subject.Class, Subject.Order, Subject.Family, Subject.Genus, Subject.Species, Subject.ScientificName, Subject.CanonicalName, Subject.Verbatim, Subject.Synonyms, Subject.Common, Subject.ID,
-    Object.Phylum, Object.Class, Object.Order, Object.Family, Object.Genus, Object.Species, Object.ScientificName, Object.CanonicalName, Object.Verbatim, Object.Synonyms, Object.Common, Object.ID
-  )
+  left_join(as_role(main_taxa, "Subject"), by = "row_id") %>%
+  left_join(as_role(named_taxa, "Object"), by = c("prey_species" = "Object.Verbatim", "EID")) %>%
+  mutate(Object.Verbatim       = prey_species,
+         Feeding.Mode          = `Feeding Mode`,
+         Important.Enemy       = as.logical(important_enemy),
+         Biocontrol            = as.logical(biological_control),
+         Associated.Plants     = I(associated_plants),
+         Associated.Industries = I(associated_industries),
+         Vectors               = I(vectors)) %>%
+  dplyr::select(Subject, Object, Type, Feeding.Mode, Important.Enemy, Biocontrol,
+                Associated.Plants, Associated.Industries, Vectors, EID, Abstract, Generated.Response,
+                all_of(subject_cols), all_of(object_cols))
 
 
-
-################################################################################
-#                            Hyperparasitoids                                  # 
-################################################################################
+# --- Hyperparasitoids: Subject = hyperparasitoid, Object = primary parasitoid (main species) ---
 
 hyperparasitoid_interactions <- df %>%
-  dplyr::select(clean_name, Phylum, Class, Order, Family, Genus, Species,
-                hyperparasitoids, EID, Abstract, Generated.Response = `Generated Response`) %>%
+  dplyr::select(row_id, hyperparasitoids, EID, Abstract, Generated.Response = `Generated Response`) %>%
   unnest(hyperparasitoids) %>%
-  
-  # 1. Join for Subject
-  left_join(main_species_ref, by = c("hyperparasitoids" = "clean_name", "EID")) %>%
-  mutate(Subject = coalesce(canonicalName, binomial_shortened),
-         Subject.Phylum = ref_phylum,
-         Subject.Class  = ref_class, 
-         Subject.Order  = ref_order, 
-         Subject.Family = ref_family,
-         Subject.Genus  = ref_genus, 
-         Subject.Species = combine_binomial(Subject.Genus, Subject), # stitch together species name if Subject is composed of genus and/or species
-         Subject.ScientificName = scientificName,
-         Subject.CanonicalName = canonicalName,
-         Subject.Verbatim = clean_name,
-         Subject.Synonyms = synonyms,
-         Subject.Common = common_names,
-         Subject.ID = gbif_id) %>%
-  
-  # Drop columns so the next join is "clean"
-  dplyr::select(-starts_with("ref_"), -c(canonicalName, scientificName, binomial_corrected, binomial_shortened, mentioned_as, gbif_id, synonyms, common_names)) %>% 
-  
-  # 2. Join for Object (Prey)
-  left_join(main_species_ref, by = c("clean_name", "EID")) %>%
-  mutate(Object = coalesce(canonicalName, binomial_shortened),
-         Object.Phylum = coalesce(ref_phylum, if_else(is.na(ref_phylum), NA, Phylum)), 
-         Object.Class  = coalesce(ref_class, if_else(is.na(ref_class), NA, Class)), 
-         Object.Order  = coalesce(ref_order, if_else(is.na(ref_order), NA, Order)), 
-         Object.Family = coalesce(ref_family, if_else(is.na(ref_family), NA, Family)), 
-         Object.Genus  = coalesce(ref_genus, if_else(is.na(ref_genus), NA, Genus)), 
-         Object.Species = combine_binomial(Object.Genus, Object), # stitch together species name if Subject is composed of genus and/or species
-         Object.ScientificName = scientificName,
-         Object.CanonicalName = canonicalName,
-         Object.Verbatim = clean_name,
-         Object.Synonyms = synonyms,
-         Object.Common = common_names,
-         Object.ID = gbif_id) %>%
-  
-  # 3. Final formatting
-  transmute(
-    Subject, 
-    Object,
-    Type = "natural enemy",
-    Feeding.Mode = "hyperparasitism",
-    EID, 
-    Abstract,
-    Generated.Response,
-    Subject.Phylum, Subject.Class, Subject.Order, Subject.Family, Subject.Genus, Subject.Species, Subject.ScientificName, Subject.Verbatim, Subject.Synonyms, Subject.Common, Subject.ID,
-    Object.Phylum, Object.Class, Object.Order, Object.Family, Object.Genus, Object.Species, Object.ScientificName, Object.Verbatim, Object.Synonyms, Object.Common, Object.ID
-  )
+  left_join(as_role(named_taxa, "Subject"), by = c("hyperparasitoids" = "Subject.Verbatim", "EID")) %>%
+  left_join(as_role(main_taxa, "Object"), by = "row_id") %>%
+  mutate(Subject.Verbatim = hyperparasitoids,
+         Type             = "natural enemy",
+         Feeding.Mode     = "hyperparasitism") %>%
+  dplyr::select(Subject, Object, Type, Feeding.Mode, EID, Abstract, Generated.Response,
+                all_of(subject_cols), all_of(object_cols))
 
 
 
 ################################################################################
-#                       Final interactions dataframe                           # 
+#                        8. Combine, filter and save                           #
 ################################################################################
 
+interactions_df <- herbivory_interactions %>%
+  full_join(full_join(predation_interactions, hyperparasitoid_interactions)) %>%
+  relocate(Object.Verbatim, .after = Object.CanonicalName)
 
-predation_interactions <- full_join(predation_interactions, hyperparasitoid_interactions)
+# remove cannibalism (Subject == Object); keep rows where either side is unresolved
+interactions_df <- interactions_df %>% filter(is.na(Subject) | is.na(Object) | Subject != Object)
 
-interactions_df <- full_join(herbivory_interactions, predation_interactions)
+# add Scopus metadata
+scopus_dir <- "../1_scopus-abstracts/scopus/"
+scopus_files <- c("export_2ffe3d67-1dba-4eda-b235-d5bf0b058d39_2025-08-24T20_19_00.364355101.rds",
+                  "export_25be7adb-0e6d-47b6-9129-3a290bafc8af_2025-08-24T20_30_35.246722592.rds",
+                  "export_67d394ef-576b-4198-82d7-a6e4cc253cc9_2025-08-24T20_26_20.523132421.rds",
+                  "export_71e456e4-31e4-41d1-9d90-57a9a7aabc74_2025-08-24T20_18_36.726340475.rds",
+                  "export_95ce8400-f987-4481-bc0a-86699cddca60_2025-08-24T20_17_41.093895810.rds",
+                  "export_d062b0aa-a511-4a97-9d1c-571922446a80_2025-08-25T17_26_26.152316033.rds",
+                  "export_fec52884-1f59-41b4-8b8f-a5331eac2834_2025-08-25T17_26_09.102103177.rds",
+                  "export_565a8258-3a3e-457d-96d1-582ae53af9b6_2025-08-24T20_16_54.168710566.rds",
+                  "export_b6c730d4-ac7f-4c2f-81bf-b0f72a3815ca_2025-08-24T20_19_36.931219694.rds",
+                  "export_c3a804bb-31a5-4079-9f6c-f3edd19c4622_2025-08-24T20_31_04.370328659.rds",
+                  "export_f1459b99-b677-4f01-8aa1-5957ba8af43c_2025-08-24T20_21_11.746507396.rds",
+                  "export_9b01d6d9-b417-41a0-87ab-fc248fccb9e2_2025-08-25T18_45_47.706146572.rds",
+                  "export_65dd9ca9-b719-4045-89b2-c6719eb05e3c_2025-08-25T18_44_00.832213554.rds",
+                  "export_781ef919-d2ac-402d-aec7-fb287887ace1_2025-08-25T18_43_35.927976733.rds",
+                  "export_a320881c-5beb-4e47-935d-8223f554ffe6_2025-08-25T18_44_49.217068331.rds",
+                  "export_bd63845b-83f7-425f-8f77-dc7f10987968_2025-08-25T18_44_35.028977485.rds",
+                  "export_eed5b52f-835e-46e3-9513-264b27de9e2f_2025-08-25T18_44_13.298152718.rds",
+                  "export_f9a6974f-add8-4d91-8f5c-7c3515c4ed29_2025-08-25T18_43_17.584212013.rds",
+                  "export_f50ff05e-aa8d-4993-a75d-361b7804daef_2025-08-25T18_45_25.449557866.rds",
+                  "export_fb20a09a-b30f-4dd6-be2b-08238ee70679_2025-08-25T18_45_10.168656744.rds",
+                  "export_064c1ea5-0952-4c9a-91a5-ee25c68e5862_2025-08-25T18_53_00.332185549.rds")
 
-# remove possible cases of cannibalism  
-interactions_df <- interactions_df %>% filter(Subject != Object) # 21 cases
-
-# include other meta data from scopus 
-scopus <- readRDS("../1_ollama-main/scopus/scopus_complete.rds")
-
-interactions_df <- left_join(interactions_df, scopus %>% dplyr::select(-Abstract), by="EID")
-
-
-
-# removal of viral, bacterial and fungal pathogens: 
-
-# how many fungi (including stramenopiles and water moulds)? 
-fungi_phyla <- c("Ascomycota","Basidiomycota","Blastocladiomycota","Chytridiomycota","Entomophthoromycota","Glomeromycota","Mucoromycota","Microsporidia","Ochrophyta","Oomycota")
-length(
-  unique(
-    na.omit(append(
-      interactions_df %>% filter(Subject.Phylum %in% fungi_phyla) %>% pull(Subject.Species), 
-      interactions_df %>% filter(Object.Phylum %in% fungi_phyla) %>% pull(Object.Species)
-    )
-  ))
-) # 331
-
-# how many bacteria? 
-bacteria_phyla <- c("Actinobacteriota","Cyanobacteria","Firmicutes","Proteobacteria")
-length(
-  unique(
-    na.omit(append(
-      interactions_df %>% filter(Subject.Phylum %in% bacteria_phyla) %>% pull(Subject.Species), 
-      interactions_df %>% filter(Object.Phylum %in% bacteria_phyla) %>% pull(Object.Species)
-    )
-  ))
-) # 75
-
-# how many protozoa? 
-protozoa_phyla <- c("Amoebozoa","Cercozoa","Ciliophora","Euglenozoa","Metamonada","Mycetozoa","Myzozoa")
-length(
-  unique(
-    na.omit(append(
-      interactions_df %>% filter(Subject.Phylum %in% protozoa_phyla) %>% pull(Subject.Species), 
-      interactions_df %>% filter(Object.Phylum %in% protozoa_phyla) %>% pull(Object.Species)
-    )
-  ))
-) # 33
-
-# how many plants? 
-plants_phyla <- c("Chlorophyta","Rhodophyta","Tracheophyta")
-length(
-  unique(
-    na.omit(append(
-      interactions_df %>% filter(Subject.Phylum %in% plants_phyla) %>% pull(Subject.Species), 
-      interactions_df %>% filter(Object.Phylum %in% plants_phyla) %>% pull(Object.Species)
-    )
-  ))
-) # 29
-
-# fungi
-nrow(interactions_df %>% filter(Subject.Phylum %in% fungi_phyla, Type=='herbivore')) # 1
-nrow(interactions_df %>% filter(Subject.Phylum %in% fungi_phyla, Type=='natural enemy')) # 3127
-
-# bacteria
-nrow(interactions_df %>% filter(Subject.Phylum %in% bacteria_phyla, Type=='herbivore')) # 0
-nrow(interactions_df %>% filter(Subject.Phylum %in% bacteria_phyla, Type=='natural enemy')) # 333
-
-# protozoa
-nrow(interactions_df %>% filter(Subject.Phylum %in% protozoa_phyla, Type=='herbivore')) # 4
-nrow(interactions_df %>% filter(Subject.Phylum %in% protozoa_phyla, Type=='natural enemy')) # 102
-
-# plants
-nrow(interactions_df %>% filter(Subject.Phylum %in% plants_phyla, Type=='herbivore')) # 19
-nrow(interactions_df %>% filter(Subject.Phylum %in% plants_phyla, Type=='natural enemy')) # 10
+scopus <- do.call(rbind, lapply(paste0(scopus_dir, scopus_files), readRDS)) %>%
+  filter(Year != 2026) %>%
+  distinct(EID, .keep_all = TRUE) %>% # one record per abstract (2-s2.0-85201321666 was exported twice with different author formatting)
+  droplevels()
+interactions_df <- left_join(interactions_df, scopus %>% dplyr::select(-Abstract), by = "EID")
 
 
-# filter out plants entirely 
+# --- Pathogens and plants ---
+
+# unique(c(unique(interactions_df$Object.Phylum, unique(interactions_df$Subject.Phylum))))
+fungi_phyla    <- c("Ascomycota", "Basidiomycota", "Blastocladiomycota", "Chytridiomycota", "Entomophthoromycota", "Glomeromycota", "Mucoromycota", "Microsporidia", "Ochrophyta", "Oomycota") # incl. stramenopiles and water moulds
+bacteria_phyla <- c("Actinobacteriota", "Cyanobacteria", "Firmicutes", "Proteobacteria")
+protozoa_phyla <- c("Amoebozoa", "Apicomplexa", "Cercozoa", "Ciliophora", "Euglenozoa", "Metamonada", "Mycetozoa", "Myzozoa", "Protozoa")
+plants_phyla   <- c("Chlorophyta", "Rhodophyta", "Tracheophyta")
+
+# number of species and of interactions (as Subject) per group
+count_species <- function(phyla) {
+  n_distinct(na.omit(c(
+    interactions_df %>% filter(Subject.Phylum %in% phyla) %>% pull(Subject.Species),
+    interactions_df %>% filter(Object.Phylum %in% phyla) %>% pull(Object.Species)
+  )))
+}
+count_rows <- function(phyla) {
+  interactions_df %>% filter(Subject.Phylum %in% phyla) %>% count(Type)
+}
+
+count_species(fungi_phyla)    # 334
+count_species(bacteria_phyla) # 74
+count_species(protozoa_phyla) # 38
+count_species(plants_phyla)   # 29
+
+count_rows(fungi_phyla)    # herbivore 1,  natural enemy 3128
+count_rows(bacteria_phyla) # herbivore 0,  natural enemy 333
+count_rows(protozoa_phyla) # herbivore 4,  natural enemy 108
+count_rows(plants_phyla)   # herbivore 19, natural enemy 10
+
+# remove plants; label fungi, bacteria and protozoa as pathogens
 interactions_df <- interactions_df %>% filter(!(Subject.Phylum %in% plants_phyla))
 
-# categorise rest as "Pathogen" 
-interactions_df[(interactions_df$Subject.Phylum %in% fungi_phyla) | 
-                (interactions_df$Subject.Phylum %in% bacteria_phyla) | 
-                (interactions_df$Subject.Phylum %in% protozoa_phyla),
-                c("Type","Feeding.Mode")] <- list("pathogen",NA)
+is_pathogen <- interactions_df$Subject.Phylum %in% c(fungi_phyla, bacteria_phyla, protozoa_phyla)
+interactions_df[is_pathogen, c("Type", "Feeding.Mode")] <- list("pathogen", NA)
 
 
-interactions_df <- interactions_df %>%
-  mutate(across(where(is.character), ~na_if(., "NA")))
-
-
-bad_industries <- c(
-  "arby crops",
-  "arberry crops",
-  "arbitrary crops",
-  "arbyle crops",
-  "arbage crops",
-  "arbile crops",
-  "arbor​e crops",
-  "arbrate crops",
-  "arbyl crops",
-  "ardrable crops",
-  "array crops"
-)
+# --- Final clean-up ---
 
 interactions_df <- interactions_df %>%
-  mutate(
-    Associated.Industries = map(
-      Associated.Industries,
-      ~ .x[!(.x %in% bad_industries)]
-    )
-  )
+  mutate(across(where(is.character), ~ na_if(., "NA")))
+
+# misspellings of "arable crops"
+bad_industries <- c("arby crops", "arberry crops", "arbitrary crops", "arbyle crops", "arbage crops", "arbile crops",
+                    "arbor​e crops", "arbrate crops", "arbyl crops", "ardrable crops", "array crops")
+
+interactions_df <- interactions_df %>%
+  mutate(Associated.Industries = map(Associated.Industries, ~ .x[!(.x %in% bad_industries)]))
 
 
-saveRDS(interactions_df %>% filter(Type == 'pathogen'), "saved_datasets/interactions_data_pathogens.rds", compress = "xz")
-saveRDS(interactions_df %>% filter(Type != 'pathogen'), "../DAPHNE_database.rds", compress = "xz")
+# drop exact duplicates (e.g. a host plant listed twice for the same species)
+interactions_df <- interactions_df %>% distinct()
 
-
-
-
-
-interactions_df <- readRDS("../DAPHNE_database.rds")
-
-nrow(interactions_df) # 175404
- 
-interactions_df %>% filter(lengths(InvasiveIn)!=0) %>% pull(Subject) %>% n_distinct() # 782
-interactions_df %>% filter(lengths(InvasiveIn)!=0) %>% pull(Type) %>% table # herbivore 7150
-
-interactions_df %>% filter(lengths(Vectors)!=0) %>% pull(Subject) %>% n_distinct() # 711
-interactions_df %>% filter(lengths(Vectors)!=0) %>% pull(Type) %>% table # herbivore 4319, natural enemy 397
-interactions_df %>% filter(lengths(Vectors)!=0, Type=='herbivore') %>% pull(Subject) %>% n_distinct() # 625
-interactions_df %>% filter(lengths(Vectors)!=0, Type=='natural enemy') %>% pull(Subject) %>% n_distinct() # 86
-
-sum(lengths(interactions_df$InvasiveIn) != 0) # 7150
-sum(lengths(interactions_df$Vectors) != 0) # 4716
-
-nrow(interactions_df %>% filter(Type=='herbivore')) # 131129 
-nrow(interactions_df %>% filter(Type=='natural enemy')) # 44275
-
-nrow(interactions_df %>% filter(Feeding.Mode=='herbivory')) # 104557
-nrow(interactions_df %>% filter(Feeding.Mode=='frugivory')) # 9653
-nrow(interactions_df %>% filter(Feeding.Mode=='granivory')) # 12178
-nrow(interactions_df %>% filter(Feeding.Mode=='gall formation')) # 4741
-nrow(interactions_df %>% filter(Type=='herbivore' & is.na(Feeding.Mode))) # 0
-
-nrow(interactions_df %>% filter(Feeding.Mode=='predation')) # 18112
-nrow(interactions_df %>% filter(Feeding.Mode=='parasitism')) # 25233
-nrow(interactions_df %>% filter(Feeding.Mode=='hyperparasitism')) # 820
-nrow(interactions_df %>% filter(Type=='natural enemy' & is.na(Feeding.Mode))) # 110
-
-
-# number of unique taxa resolved at the species level
-length(
-  unique(
-    append(
-      interactions_df %>% pull(Subject.Species), 
-      interactions_df %>% pull(Object.Species)
-    )
-  )
-) # 16755
-
-# linked to GBIF specifically 
-length(
-  unique(
-    append(
-      interactions_df %>% filter(str_count(Subject.CanonicalName, "\\w+") > 1) %>% pull(Subject.CanonicalName), 
-      interactions_df %>% filter(str_count(Object.CanonicalName, "\\w+") > 1) %>% pull(Object.CanonicalName)
-    )
-  )
-) # 15017
+saveRDS(interactions_df %>% filter(Type == "pathogen"), "saved_datasets/interactions_data_pathogens.rds", compress = "xz")
+saveRDS(interactions_df %>% filter(Type != "pathogen"), "../DAPHNE.rds", compress = "xz")
 
 
 
-# Plotting classes 
+################################################################################
+#                          9. Summary statistics                               #
+################################################################################
 
-plot_classes <- function(interactions_df, title, feeding_modes, target_classes, filename, order_text_size=1.8, xlab="Species Count", ylab="Class"){
-  
+interactions_df <- readRDS("../DAPHNE.rds")
+
+nrow(interactions_df) # 175359
+
+# invasive species and vectors
+interactions_df %>% filter(lengths(InvasiveIn) != 0) %>% pull(Subject) %>% n_distinct() # 780
+interactions_df %>% filter(lengths(InvasiveIn) != 0) %>% pull(Type) %>% table()         # herbivore 7148
+
+interactions_df %>% filter(lengths(Vectors) != 0) %>% pull(Subject) %>% n_distinct()   # 711
+interactions_df %>% filter(lengths(Vectors) != 0) %>% pull(Type) %>% table()           # herbivore 4317, natural enemy 397
+interactions_df %>% filter(lengths(Vectors) != 0, Type == "herbivore") %>% pull(Subject) %>% n_distinct()     # 625
+interactions_df %>% filter(lengths(Vectors) != 0, Type == "natural enemy") %>% pull(Subject) %>% n_distinct() # 86
+
+sum(lengths(interactions_df$InvasiveIn) != 0) # 7148
+sum(lengths(interactions_df$Vectors) != 0)    # 4714
+
+# interactions per type and feeding mode
+nrow(interactions_df %>% filter(Type == "herbivore"))     # 131120
+nrow(interactions_df %>% filter(Type == "natural enemy")) # 44239
+
+nrow(interactions_df %>% filter(Feeding.Mode == "herbivory"))      # 104552
+nrow(interactions_df %>% filter(Feeding.Mode == "frugivory"))      # 9649
+nrow(interactions_df %>% filter(Feeding.Mode == "granivory"))      # 12178
+nrow(interactions_df %>% filter(Feeding.Mode == "gall formation")) # 4741
+nrow(interactions_df %>% filter(Type == "herbivore" & is.na(Feeding.Mode))) # 0
+
+nrow(interactions_df %>% filter(Feeding.Mode == "predation"))       # 18095
+nrow(interactions_df %>% filter(Feeding.Mode == "parasitism"))      # 25224
+nrow(interactions_df %>% filter(Feeding.Mode == "hyperparasitism")) # 810
+nrow(interactions_df %>% filter(Type == "natural enemy" & is.na(Feeding.Mode))) # 110
+
+# unique taxa resolved at species level
+n_distinct(c(interactions_df$Subject.Species, interactions_df$Object.Species)) # 16882
+
+# ... of which matched to a GBIF species
+n_distinct(c(
+  interactions_df %>% filter(str_count(Subject.CanonicalName, "\\w+") > 1) %>% pull(Subject.CanonicalName),
+  interactions_df %>% filter(str_count(Object.CanonicalName, "\\w+") > 1) %>% pull(Object.CanonicalName)
+)) # 15089
+
+
+
+################################################################################
+#                               10. Figures                                    #
+################################################################################
+
+# Horizontal stacked bars of species counts per class, split into orders for `target_classes`
+plot_classes <- function(interactions_df, title, feeding_modes, target_classes, filename, order_text_size = 1.8, xlab = "Species Count", ylab = "Class") {
+
   plot_data <- interactions_df %>%
-    filter(
-      Feeding.Mode %in% feeding_modes,
-      str_count(Subject.CanonicalName, "\\w+") > 1
-    ) %>%
+    filter(Feeding.Mode %in% feeding_modes,
+           str_count(Subject.CanonicalName, "\\w+") > 1) %>%
     dplyr::select(Subject.CanonicalName, Subject.Phylum, Subject.Class, Subject.Order) %>%
     distinct() %>%
-    
-    # Create class labels, putting incomplete taxonomy into "Other classes"
-    mutate(
-      Phylum_Class = case_when(
-        is.na(Subject.Phylum) | is.na(Subject.Class) |
-          Subject.Phylum == "" | Subject.Class == "" ~ "Other classes",
-        TRUE ~ paste0(Subject.Phylum, ": ", Subject.Class)
-      )
-    ) %>%
-    
-    # Also collapse singleton classes into "Other classes"
+
+    # class labels; incomplete taxonomy goes to "Other classes"
+    mutate(Phylum_Class = case_when(
+      is.na(Subject.Phylum) | is.na(Subject.Class) | Subject.Phylum == "" | Subject.Class == "" ~ "Other classes",
+      TRUE ~ paste0(Subject.Phylum, ": ", Subject.Class)
+    )) %>%
+
+    # classes with fewer than 10 species also go to "Other classes"
     group_by(Phylum_Class) %>%
     mutate(class_total = n()) %>%
     ungroup() %>%
-    mutate(
-      Phylum_Class = if_else(
-        Phylum_Class != "Other classes" & class_total < 10,
-        "Other classes",
-        Phylum_Class
-      )
-    ) %>%
-    
-    # Count orders within classes
+    mutate(Phylum_Class = if_else(Phylum_Class != "Other classes" & class_total < 10, "Other classes", Phylum_Class)) %>%
+
+    # label orders (>= 10 species) within target classes
     group_by(Phylum_Class, Subject.Order) %>%
     mutate(order_count = n()) %>%
     ungroup() %>%
-    
-    # Decide which labels to show
-    mutate(
-      Sub_Group_Name = case_when(
-        Phylum_Class %in% target_classes & order_count >= 10 ~ Subject.Order,
-        TRUE ~ Phylum_Class
-      )
-    ) %>%
-    
-    # Aggregate counts
+    mutate(Sub_Group_Name = if_else(Phylum_Class %in% target_classes & order_count >= 10, Subject.Order, Phylum_Class)) %>%
+
     count(Phylum_Class, Sub_Group_Name) %>%
     group_by(Phylum_Class) %>%
-    # 1. Arrange strictly by size (Descending for Large -> Small)
-    arrange(desc(n)) %>% 
-    mutate(
-      # 2. Assign color rank based on this strict descending order
-      rank_in_bar = row_number(),
-      total_bar_n = sum(n),
-      color_id = if_else(Phylum_Class %in% target_classes, as.character(rank_in_bar), "base")
-    ) %>%
+    arrange(desc(n)) %>%
+    mutate(rank_in_bar = row_number(),
+           total_bar_n = sum(n),
+           color_id = if_else(Phylum_Class %in% target_classes, as.character(rank_in_bar), "base")) %>%
     ungroup() %>%
-    # 3. CRITICAL: Force the factor levels of the subgroup to follow the size order
-    # This prevents ggplot from default-sorting alphabetically
-    mutate(Sub_Group_Name = reorder(Sub_Group_Name, n)) %>%
-    mutate(Phylum_Class = reorder(Phylum_Class, total_bar_n))
-  
-  # 2. Define consistent color palette
-  # "base" is grey; "1", "2", etc., follow a specific sequence
+    # order segments by size and bars by total (instead of alphabetically)
+    mutate(Sub_Group_Name = reorder(Sub_Group_Name, n),
+           Phylum_Class = reorder(Phylum_Class, total_bar_n))
+
+  # grey for non-target classes, pastel colours by segment rank otherwise
   unique_ranks <- sort(unique(plot_data$color_id[plot_data$color_id != "base"]))
-  #palette_values <- c("base" = "grey85", setNames(scales::hue_pal()(length(unique_ranks)), unique_ranks))
-  n_colors <- length(unique_ranks)
-  target_colors <- colorRampPalette(scales::brewer_pal(palette = "Pastel2")(8))(n_colors)
+  target_colors <- colorRampPalette(scales::brewer_pal(palette = "Pastel2")(8))(length(unique_ranks))
   palette_values <- c("base" = "grey90", setNames(target_colors, unique_ranks))
-  
-  # 3. Plot
-  classPlot <- ggplot(plot_data, aes(y = Phylum_Class, x = n, fill = color_id, group = rank_in_bar)) +
-    geom_col(show.legend = FALSE, color = "white", linewidth = 0.2) + 
+
+  ggplot(plot_data, aes(y = Phylum_Class, x = n, fill = color_id, group = rank_in_bar)) +
+    geom_col(show.legend = FALSE, color = "white", linewidth = 0.2) +
     geom_text(
       aes(label = if_else(Phylum_Class %in% target_classes, Sub_Group_Name, "")),
-      # position_stack uses the 'group' aesthetic to decide order
       position = position_stack(vjust = 0.5),
       color = "black", size = order_text_size, check_overlap = TRUE
     ) +
@@ -1280,58 +925,39 @@ plot_classes <- function(interactions_df, title, feeding_modes, target_classes, 
     ) +
     scale_fill_manual(values = palette_values) +
     scale_y_discrete(limits = rev) +
-    scale_x_continuous(expand = expansion(mult = c(0, 0.15))) + 
-    labs(
-      title = title,
-      x = xlab,
-      y = ylab
-    ) +
-    theme_minimal() + 
-    theme(
-      #panel.grid.major = element_blank(), 
-      panel.grid.minor = element_blank()
-    )
-  
-  #ggsave(filename = sprintf("figures/%s", filename), classPlot, width = 320, height = 130, units = "mm", dpi = 300)
-  
-  return(classPlot) 
+    scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
 }
 
-
-# 1. plot herbivore phyla
 p1 <- plot_classes(interactions_df,
                    title = "a. Herbivores",
-                   feeding_modes = c('herbivory'), 
-                   target_classes = c("Arthropoda: Insecta", "Arthropoda: Arachnida", "Chordata: Mammalia", "Nematoda: Chromadorea"), 
-                   filename="class_counts_herbivores.png",
-                   order_text_size=1.3,
-                   xlab="", ylab="")
+                   feeding_modes = c("herbivory"),
+                   target_classes = c("Arthropoda: Insecta", "Arthropoda: Arachnida", "Chordata: Mammalia", "Nematoda: Chromadorea"),
+                   filename = "class_counts_herbivores.png",
+                   order_text_size = 1.3,
+                   xlab = "", ylab = "")
 
-# 2. plot predator phyla 
 p2 <- plot_classes(interactions_df,
                    title = "b. Predators",
-                   feeding_modes = c('predation'), 
-                   target_classes = c("Arthropoda: Insecta", "Arthropoda: Arachnida", "Chordata: Mammalia", "Chordata: Aves"), 
-                   filename="class_counts_predators.png",
-                   order_text_size=1.6,
-                   xlab="", ylab="Class")
+                   feeding_modes = c("predation"),
+                   target_classes = c("Arthropoda: Insecta", "Arthropoda: Arachnida", "Chordata: Mammalia", "Chordata: Aves"),
+                   filename = "class_counts_predators.png",
+                   order_text_size = 1.6,
+                   xlab = "", ylab = "Class")
 
-# 3. plot parasite/parasitoid/hyperparasitoid phyla 
 p3 <- plot_classes(interactions_df,
-                   title = "c. Parasites, parasitoids and hyperparasitoids", 
-                   feeding_modes = c('parasitism', 'hyperparasitism'), 
-                   target_classes = c("Arthropoda: Insecta", "Ascomycota: Sordariomycetes", "Nematoda: Chromadorea"), 
-                   filename="class_counts_parasitoids.png",
-                   order_text_size=1.6,
-                   xlab="Species Count", ylab="")
+                   title = "c. Parasites, parasitoids and hyperparasitoids",
+                   feeding_modes = c("parasitism", "hyperparasitism"),
+                   target_classes = c("Arthropoda: Insecta", "Ascomycota: Sordariomycetes", "Nematoda: Chromadorea"),
+                   filename = "class_counts_parasitoids.png",
+                   order_text_size = 1.6,
+                   xlab = "Species Count", ylab = "")
 
-
-combined_plot <- (p1 / p2 / p3) + 
-  plot_layout(guides = "collect") & 
+combined_plot <- (p1 / p2 / p3) +
+  plot_layout(guides = "collect") &
   theme(axis.title = element_text(size = 12),
         axis.text.y = element_text(size = 8))
 
 ggsave("figures/class_counts.pdf", combined_plot, width = 350, height = 200, units = "mm", dpi = 500)
-
-
-
