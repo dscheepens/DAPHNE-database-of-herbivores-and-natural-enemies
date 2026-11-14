@@ -132,7 +132,7 @@ ggplot(
 
 nrow(df.complete) # 112,831
 
-saveRDS(object = df.complete, file = paste0(scopusDir, 'scopus_complete.rds'))
+# saveRDS(object = df.complete, file = paste0(scopusDir, 'scopus_complete.rds'))
 
 
 
