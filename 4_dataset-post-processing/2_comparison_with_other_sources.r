@@ -534,6 +534,18 @@ dat <- bind_rows(agreement_oliver, agreement_predators, agreement_parasitoids, a
 
 print(dat %>% dplyr::select(source, comparison, nEID, agreement, n_correct, n_total), n = Inf)
 
+# Overall EPPO recall: hosts and major hosts of all EPPO crops pooled
+# (equal to the nEID >= 1 rows of the EPPO comparisons above)
+eppo_major <- eppo_matches %>% filter(type == "Major host")
+eppo_recall <- tibble(
+  comparison = c("Host or major host & nPest > 0", "Major host & nMajor > 0", "Major host & nPest > 0"),
+  n_correct  = c(sum(eppo_matches$nPest > 0), sum(eppo_major$nMajor > 0), sum(eppo_major$nPest > 0)),
+  n_total    = c(nrow(eppo_matches), nrow(eppo_major), nrow(eppo_major))
+) %>%
+  mutate(recall = round(100 * n_correct / n_total, 1))
+
+print(eppo_recall)
+
 
 # --- Plot layout ---
 
