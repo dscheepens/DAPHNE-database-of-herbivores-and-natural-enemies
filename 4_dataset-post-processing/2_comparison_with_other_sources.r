@@ -380,128 +380,7 @@ parasitoid_counts %>% filter(nEID.Enemy < nEID.Herbivore) # Oscinella frit, Trog
 #              4. EPPO global database: crop hosts of pests                    #
 ################################################################################
 
-# Crop name patterns, grouped following FAO definitions
-# (https://www.fao.org/fileadmin/templates/ess/documents/world_census_of_agriculture/appendix3_r7.pdf)
-crop_lookup <- tribble(
-  ~crop_name, ~pattern, ~crop_group, ~crop_class,
-
-  # --- 1. CEREALS ---
-  "wheat", "\\b(wheat|triticum)\\b", "Cereals", "Wheat",
-  "maize", "\\b(maize|corn|zea mays)\\b", "Cereals", "Maize",
-  "rice", "\\b(rice|oryza)\\b", "Cereals", "Rice",
-  "barley", "\\b(barley|hordeum)\\b", "Cereals", "Barley",
-  "sorghum", "\\b(sorghum)\\b", "Cereals", "Sorghum",
-  "millet", "\\b(millet|panicum|setaria|eleusine|pennisetum|digitaria)\\b", "Cereals", "Millets",
-  "rye", "\\b(rye|secale)\\b", "Cereals", "Rye",
-  "oats", "\\b(oat|avena)\\b", "Cereals", "Oats",
-  "mixed cereals", "\\b(cereal|grain)\\b", "Cereals", "Other cereals",
-
-  # --- 2. VEGETABLES ---
-  # Leafy
-  "cabbage", "\\b(cabbage|brassica oleracea)\\b", "Vegetables", "Leafy vegetables",
-  "lettuce", "\\b(lettuce|lactuca sativa)\\b", "Vegetables", "Leafy vegetables",
-  "spinach", "\\b(spinach|spinacia)\\b", "Vegetables", "Leafy vegetables",
-
-  # Fruit vegetables
-  "tomato", "\\b(tomato|solanum lycopersicum)\\b", "Vegetables", "Fruit-bearing vegetables",
-  "eggplant", "\\b(eggplant|aubergine|solanum melongena)\\b", "Vegetables", "Fruit-bearing vegetables",
-  "cucumber", "\\b(cucumber|cucumis sativus)\\b", "Vegetables", "Fruit-bearing vegetables",
-  "melon", "\\b(melon|cucumis melo|cantaloupe)\\b", "Vegetables", "Fruit-bearing vegetables",
-  "pumpkin", "\\b(pumpkin|squash|gourd|cucurbita)\\b", "Vegetables", "Fruit-bearing vegetables",
-
-  # Roots & bulbs
-  "carrot", "\\b(carrot|daucus carota)\\b", "Vegetables", "Root vegetables",
-  "onion", "\\b(onion|allium cepa)\\b", "Vegetables", "Bulb vegetables",
-  "garlic", "\\b(garlic|allium sativum)\\b", "Vegetables", "Bulb vegetables",
-
-  # --- 3. FRUITS & NUTS ---
-  # Tropical
-  "banana", "\\b(banana|musa)\\b", "Fruit & Nuts", "Tropical fruit",
-  "plantain", "\\b(plantain|musa paradisiaca)\\b", "Fruit & Nuts", "Tropical fruit",
-  "mango", "\\b(mango|mangifera indica)\\b", "Fruit & Nuts", "Tropical fruit",
-  "papaya", "\\b(papaya|carica papaya)\\b", "Fruit & Nuts", "Tropical fruit",
-  "pineapple", "\\b(pineapple|ananas)\\b", "Fruit & Nuts", "Tropical fruit",
-  "avocado", "\\b(avocado|persea americana)\\b", "Fruit & Nuts", "Tropical fruit",
-
-  # Citrus
-  "orange", "\\b(orange|citrus sinensis)\\b", "Fruit & Nuts", "Citrus",
-  "lemon", "\\b(lemon|citrus limon)\\b", "Fruit & Nuts", "Citrus",
-  "lime", "\\b(lime|citrus aurantiifolia)\\b", "Fruit & Nuts", "Citrus",
-  "grapefruit", "\\b(grapefruit|citrus paradisi)\\b", "Fruit & Nuts", "Citrus",
-
-  # Temperate
-  "apple", "\\b(apple|malus domestica)\\b", "Fruit & Nuts", "Pome fruit",
-  "pear", "\\b(pear|pyrus)\\b", "Fruit & Nuts", "Pome fruit",
-  "peach", "\\b(peach|prunus persica)\\b", "Fruit & Nuts", "Stone fruit",
-  "plum", "\\b(plum|prunus domestica)\\b", "Fruit & Nuts", "Stone fruit",
-  "cherry", "\\b(cherry|prunus avium)\\b", "Fruit & Nuts", "Stone fruit",
-  "grape", "\\b(grape|vitis)\\b", "Fruit & Nuts", "Grapes",
-
-  # Nuts
-  "almond", "\\b(almond|prunus dulcis)\\b", "Fruit & Nuts", "Nuts",
-  "cashew", "\\b(cashew|anacardium occidentale)\\b", "Fruit & Nuts", "Nuts",
-  "walnut", "\\b(walnut|juglans)\\b", "Fruit & Nuts", "Nuts",
-
-  # --- 4. OILSEEDS ---
-  "soybean", "\\b(soybean|glycine max)\\b", "Oilseed crops", "Soya beans",
-  "groundnut", "\\b(groundnut|peanut|arachis hypogaea)\\b", "Oilseed crops", "Groundnuts",
-  "rapeseed", "\\b(rapeseed|canola|brassica napus)\\b", "Oilseed crops", "Rapeseed",
-  "sunflower", "\\b(sunflower|helianthus annuus)\\b", "Oilseed crops", "Sunflower",
-  "sesame", "\\b(sesame|sesamum indicum)\\b", "Oilseed crops", "Sesame",
-  "linseed", "\\b(linseed|flax|linum usitatissimum)\\b", "Oilseed crops", "Linseed",
-  "mustard", "\\b(mustard|sinapis)\\b", "Oilseed crops", "Mustard",
-
-  # Permanent oil crops
-  "coconut", "\\b(coconut|cocos nucifera)\\b", "Oilseed crops", "Permanent oil crops",
-  "oil palm", "\\b(oil palm|elaeis guineensis)\\b", "Oilseed crops", "Permanent oil crops",
-  "olive", "\\b(olive|olea europaea)\\b", "Oilseed crops", "Permanent oil crops",
-
-  # --- 5. ROOT / TUBER ---
-  "potato", "\\b(potato|solanum tuberosum)\\b", "Roots & tubers", "Potatoes",
-  "sweet potato", "\\b(sweet potato|ipomoea batatas)\\b", "Roots & tubers", "Sweet potatoes",
-  "cassava", "\\b(cassava|manihot esculenta|tapioca)\\b", "Roots & tubers", "Cassava",
-  "yam", "\\b(yam|dioscorea)\\b", "Roots & tubers", "Yams",
-  "taro", "\\b(taro|colocasia esculenta)\\b", "Roots & tubers", "Other roots",
-
-  # --- 6. BEVERAGE & SPICES ---
-  "coffee", "\\b(coffee|coffea arabica|coffea canephora)\\b", "Beverage crops", "Coffee",
-  "tea", "\\b(tea|camellia sinensis)\\b", "Beverage crops", "Tea",
-  "cocoa", "\\b(cocoa|cacao|theobroma cacao)\\b", "Beverage crops", "Cocoa",
-
-  "chili", "\\b(chili|chilli|bell pepper|capsicum)\\b", "Spice crops", "Temporary spices",
-  "pepper spice", "\\b(black pepper|piper nigrum)\\b", "Spice crops", "Permanent spices",
-  "ginger", "\\b(ginger|zingiber officinale)\\b", "Spice crops", "Permanent spices",
-  "cinnamon", "\\b(cinnamon|cinnamomum)\\b", "Spice crops", "Permanent spices",
-
-  # --- 7. LEGUMES ---
-  "beans", "\\b(bean|phaseolus|vigna)\\b", "Legumes", "Beans",
-  "chickpea", "\\b(chickpea|cicer arietinum)\\b", "Legumes", "Chickpeas",
-  "cowpea", "\\b(cowpea|vigna unguiculata)\\b", "Legumes", "Cowpeas",
-  "lentil", "\\b(lentil|lens culinaris)\\b", "Legumes", "Lentils",
-  "pea", "\\b(pea|pisum sativum)\\b", "Legumes", "Peas",
-  "pigeon pea", "\\b(pigeon pea|cajanus cajan)\\b", "Legumes", "Pigeon peas",
-
-  # --- 8. SUGAR ---
-  "sugarcane", "\\b(sugarcane|saccharum officinarum)\\b", "Sugar crops", "Sugar cane",
-  "sugarbeet", "\\b(sugar beet|beta vulgaris)\\b", "Sugar crops", "Sugar beet",
-  "sweet sorghum", "\\b(sweet sorghum)\\b", "Sugar crops", "Other sugar crops",
-
-  # --- 9. OTHER ---
-  "cotton", "\\b(cotton|gossypium)\\b", "Fibre crops", "Cotton",
-  "jute", "\\b(jute|corchorus)\\b", "Fibre crops", "Fibre crops",
-  "flax", "\\b(flax|linum)\\b", "Fibre crops", "Fibre crops",
-  "rubber", "\\b(rubber|hevea brasiliensis)\\b", "Industrial crops", "Rubber",
-  "tobacco", "\\b(tobacco|nicotiana)\\b", "Industrial crops", "Tobacco",
-  "alfalfa", "\\b(alfalfa|medicago sativa)\\b", "Fodder crops", "Fodder",
-  "grass", "\\b(grass|fodder|pasture)\\b", "Fodder crops", "Fodder",
-
-  # Extra: five common forest plantation species
-  "pine", "\\b(pine|pinus)\\b", "Forest plantation", "Softwood forest",
-  "douglas fir", "\\b(douglas-fir|douglas fir|pseudotsuga menziesii)\\b", "Forest plantation", "Softwood forest",
-  "spruce", "\\b(spruce|picea)\\b", "Forest plantation", "Softwood forest",
-  "teak", "\\b(teak|tectona grandis)\\b", "Forest plantation", "Hardwood forest",
-  "eucalyptus", "\\b(eucalyptus|eucalypt)\\b", "Forest plantation", "Hardwood forest"
-)
+source("crop_definitions.r") # crop_lookup: crop name patterns shared by all scripts
 
 # Herbivore-crop pairs in DAPHNE (host plant matched to a crop by name pattern)
 herbivore_summary <- interactions_df %>%
@@ -516,8 +395,9 @@ herbivore_summary <- interactions_df %>%
             Synonyms = list(unique(unlist(Subject.Synonyms))),
             .groups = "drop")
 
-# Crops whose EPPO host list is split over several host species
+# EPPO file names that differ from the crop name (or that are split over several host species)
 eppo_files <- list(
+  `oil palm` = "oilpalm",
   coffee  = c("coffee_Coffea-arabica", "coffee_Coffea-canephora"),
   millet  = c("millet_Cenchrus-americanus", "millet_Panicum-miliaceum", "millet_Setaria-italica"),
   mustard = c("mustard_Brassica-carinata", "mustard_Brassica-juncea", "mustard_Brassica-nigra")
@@ -753,4 +633,4 @@ p_publication <- ggplot(dat_plot, aes(x = x, y = agreement, fill = nEID)) +
 
 p_publication
 
-ggsave("figures/sources_comparison.pdf", p_publication, width = 12, height = 6, units = "in", device = cairo_pdf)
+ggsave("../figures/sources_comparison.pdf", p_publication, width = 12, height = 6, units = "in", device = cairo_pdf)

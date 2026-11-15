@@ -960,4 +960,4 @@ combined_plot <- (p1 / p2 / p3) +
   theme(axis.title = element_text(size = 12),
         axis.text.y = element_text(size = 8))
 
-ggsave("figures/class_counts.pdf", combined_plot, width = 350, height = 200, units = "mm", dpi = 500)
+ggsave("../figures/class_counts.pdf", combined_plot, width = 350, height = 200, units = "mm", dpi = 500)
