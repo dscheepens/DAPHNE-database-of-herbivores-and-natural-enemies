@@ -3,3 +3,6 @@
 
 # other hidden files
 *.ipynb_checkpoints
+
+# shinyapps.io deployment records (machine-specific)
+shiny_app/rsconnect/
