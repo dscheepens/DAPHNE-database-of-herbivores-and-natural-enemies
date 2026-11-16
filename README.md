@@ -10,9 +10,9 @@ bioRxiv 2026.09.28.754864; doi: https://doi.org/10.64898/2026.09.28.754864
 
 The complete, post-processed dataset is contained in `DAPHNE.rds`. 
 
-`1_scopus-abstracts`: Run `filter_abstracts.R` to filter out abstracts from the raw .csv Scopus downloads (in `scopus/`) that do not contain any scientific names. The script then combines the filtered data (`scopus/*.rds`) into a complete dataframe `scopus/scopus_complete.rds`. `4_world_map_publications.r` creates the map of the number of publications per country.
+`1_scopus-abstracts`: Run `filter_abstracts.R` to filter out abstracts from the raw .csv Scopus downloads (in `scopus/`) that do not contain any scientific names. The script saves the filtered Scopus records as .rds files (`scopus/*.rds`). `plot_world_map_publications.r` creates the map of the number of publications per country.
 
-`2_ollama-main`: The main LLM pipeline used to run gpt-oss:120b on an Nvidia run:ai server. `ollama-main.ipynb` contains the full pipeline to run the model on all abstracts in `scopus_complete.rds`. The raw model output is saved in `raw_data/`, split across ten .feather files.
+`2_ollama-main`: The main LLM pipeline used to run gpt-oss:120b on an Nvidia run:ai server. `ollama-main.ipynb` contains the full pipeline to run the model on all filtered abstracts. The raw model output is saved in `raw_data/`, split across ten .feather files.
 
 `3_model-validation`: All validation steps used to validate the model against the manually-labelled training and test set. `model-validation.ipynb` contains the full code.
 
