@@ -156,8 +156,8 @@ print_crop_latex_table <- function(crop_lookup) {
   
     # Sanitize the other dataframe table text strings
     c_name  <- gsub("_", "\\\\_", row$crop_name)
-    c_group <- gsub("_", "\\\\_", row$crop_group)
-    c_class <- gsub("_", "\\\\_", row$crop_class)
+    c_group <- gsub("&", "\\\\&", gsub("_", "\\\\_", row$crop_group)) # e.g. "Roots & tubers"
+    c_class <- gsub("&", "\\\\&", gsub("_", "\\\\_", row$crop_class))
   
     # Print the structural line
     cat(c_name, " & ", latex_pattern, " & ", c_group, " & ", c_class, " \\\\ \\hline \n")
